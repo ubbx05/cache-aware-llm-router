@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import config
+from cacheweaver_dualmap_router import CacheWeaverDualMapRouter
 from prefix_tracker import PrefixTracker
 from worker_metrics import Snapshot, WorkerState
 
@@ -170,6 +171,78 @@ class CacheAware(Strategy):
         )
 
 
+class CacheWeaverDualMapStrategy(Strategy):
+    """Baseline: CacheWeaver greedy-reorder + DualMap dual-hash/SLO/hotspot
+    hybrid (cacheweaver_dualmap_router.py), wrapped to fit this router's
+    Strategy interface.
+
+    Timing convention: on_request_finished() is called here, inside select(),
+    right after the decision is made -- the same dispatch-time point where
+    CacheAware's tracker.record() happens in main.py's _choose(). This keeps
+    the ablation table comparable: any TTFT/hit-rate gap against cache_aware
+    is attributable to the algorithm, not to a bookkeeping-timing mismatch.
+    If you want to characterise dispatch-vs-completion as its own axis later,
+    apply the same change to BOTH strategies, not just this one.
+
+    Units caveat: DualMap's ReplicaState.num_pending_prefill_tokens wants a
+    TOKEN count, but this router only exposes request-level queue depth
+    (num_requests_waiting). AVG_PROMPT_TOKENS_ESTIMATE below is a placeholder
+    conversion -- replace it with a number you actually measured (e.g. mean
+    prompt_tokens from a validate_tracker.py run) before trusting any TTFT
+    estimate this strategy produces.
+    """
+
+    name = "cacheweaver_dualmap"
+
+    # TODO(kalibrasyon): placeholder, gercek RAG promptlarinin ortalama token
+    # sayisiyla degistir (validate_tracker.py ciktisindaki "prompt ort" satiri).
+    AVG_PROMPT_TOKENS_ESTIMATE = 1700
+
+    def __init__(self, tracker: PrefixTracker):
+        super().__init__(tracker)
+        # Fixed at construction time so replica indices stay stable across
+        # calls even if a worker briefly drops out of snap.healthy().
+        self._names = [w.name for w in config.WORKERS if w.enabled]
+        self._name_to_idx = {name: i for i, name in enumerate(self._names)}
+        self._router = CacheWeaverDualMapRouter(num_replicas=len(self._names))
+        self._req_counter = itertools.count()
+
+    def select(self, ctx: RequestContext, snap: Snapshot) -> Decision:
+        healthy = snap.healthy()
+        if not healthy:
+            raise NoHealthyWorker()
+
+        idx_to_worker: dict[int, WorkerState] = {}
+        for s in healthy:
+            idx = self._name_to_idx.get(s.name)
+            if idx is None:
+                continue  # worker not part of the fixed index mapping (unexpected)
+            idx_to_worker[idx] = s
+            pending_tokens = s.num_requests_waiting * self.AVG_PROMPT_TOKENS_ESTIMATE
+            self._router.update_replica_load(idx, int(pending_tokens))
+
+        chunk_ids = ctx.chunk_hashes or ctx.block_hashes
+        decision = self._router.route_request(
+            request_id=str(next(self._req_counter)),
+            retrieved_chunk_ids=chunk_ids,
+        )
+
+        # Dispatch-time bookkeeping -- see class docstring.
+        self._router.on_request_finished(decision)
+
+        worker = idx_to_worker.get(decision.primary_replica)
+        if worker is None:
+            # Chosen replica isn't currently healthy (e.g. dropped out between
+            # calls) -- fail safe rather than crash the request.
+            worker = healthy[0]
+
+        reason = "cache_affinity" if decision.used_cache_affinity else "slo_min_ttft"
+        if decision.migrated:
+            reason += "+migrated"
+
+        return Decision(worker=worker, reason=reason, scores={}, cache_gain=0.0)
+
+
 class NoHealthyWorker(RuntimeError):
     pass
 
@@ -178,6 +251,7 @@ _REGISTRY: dict[str, type[Strategy]] = {
     RoundRobin.name: RoundRobin,
     LeastLoaded.name: LeastLoaded,
     CacheAware.name: CacheAware,
+    CacheWeaverDualMapStrategy.name: CacheWeaverDualMapStrategy,
 }
 
 
