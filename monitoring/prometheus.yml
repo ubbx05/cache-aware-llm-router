@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'vllm-worker-1'
+    static_configs:
+      - targets: ['100.89.101.52:8000']
+        labels:
+          worker: 'w1'
