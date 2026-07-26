@@ -84,6 +84,23 @@ class Result:
     output_text: str = ""
     gold_answer: str | None = None
 
+    # The two sides of the tracker-validation comparison.
+    # `believed_*` is the router's own estimate, read off a response header.
+    # `actual_cached_tokens` is what the engine reports it truly reused, via
+    # usage.prompt_tokens_details.cached_tokens. Everything cache_gain drives
+    # rests on these two agreeing, so it gets measured rather than assumed.
+    believed_cached_tokens: int | None = None
+    believed_frac: float | None = None
+    prompt_blocks: int | None = None
+    actual_cached_tokens: int | None = None
+    prompt_tokens: int | None = None
+
+    @property
+    def actual_frac(self) -> float | None:
+        if self.actual_cached_tokens is None or not self.prompt_tokens:
+            return None
+        return self.actual_cached_tokens / self.prompt_tokens
+
     @property
     def tpot_s(self) -> float | None:
         if self.ttft_s is None or self.total_s is None or self.output_tokens < 2:
@@ -128,6 +145,11 @@ async def fire(client: httpx.AsyncClient, args, rec: dict, messages: list[dict],
         "stream": True,
         "max_tokens": args.max_tokens,
         "temperature": 0.0,
+        # Makes vLLM append a final chunk carrying usage, including
+        # prompt_tokens_details.cached_tokens -- the engine's own count of how
+        # many prompt tokens it served from cache. Without this the run cannot
+        # be graded against the router's belief.
+        "stream_options": {"include_usage": True},
     }
     # Chunk ids travel alongside the request so a chunk-coverage strategy can use
     # them directly. Under canonical ordering the router does not need them --
@@ -140,6 +162,14 @@ async def fire(client: httpx.AsyncClient, args, rec: dict, messages: list[dict],
                                  json=payload, headers=headers) as r:
             res.worker = r.headers.get("x-router-worker")
             res.reason = r.headers.get("x-router-reason")
+            # Absent when talking to a bare vLLM or a third-party router; the
+            # run still works, only the tracker comparison is unavailable.
+            _bt = r.headers.get("x-router-believed-cached-tokens")
+            _bf = r.headers.get("x-router-believed-frac")
+            _pb = r.headers.get("x-router-prompt-blocks")
+            res.believed_cached_tokens = int(_bt) if _bt else None
+            res.believed_frac = float(_bf) if _bf else None
+            res.prompt_blocks = int(_pb) if _pb else None
             if r.status_code != 200:
                 await r.aread()
                 res.error = f"http {r.status_code}"
@@ -151,9 +181,23 @@ async def fire(client: httpx.AsyncClient, args, rec: dict, messages: list[dict],
                 if body == "[DONE]":
                     break
                 try:
-                    delta = json.loads(body)["choices"][0].get("delta", {})
-                except (json.JSONDecodeError, KeyError, IndexError):
+                    chunk = json.loads(body)
+                except json.JSONDecodeError:
                     continue
+
+                # The usage chunk arrives last and carries an EMPTY choices
+                # list. Indexing choices[0] first would raise and skip it, which
+                # is exactly how this data gets lost silently.
+                usage = chunk.get("usage")
+                if usage:
+                    res.prompt_tokens = usage.get("prompt_tokens")
+                    details = usage.get("prompt_tokens_details") or {}
+                    res.actual_cached_tokens = details.get("cached_tokens")
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
                 if delta.get("content"):
                     if res.ttft_s is None:
                         res.ttft_s = time.perf_counter() - start
@@ -237,7 +281,7 @@ async def run(args) -> None:
     out = Path(args.out)
     with out.open("w", encoding="utf-8") as f:
         for r in results:
-            row = r.__dict__ | {"tpot_s": r.tpot_s}
+            row = r.__dict__ | {"tpot_s": r.tpot_s, "actual_frac": r.actual_frac}
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     summarise(results, before, after, wall, args, out)

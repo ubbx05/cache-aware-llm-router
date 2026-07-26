@@ -152,13 +152,21 @@ def _choose(payload: dict):
     decision = strategy.select(ctx, poller.snapshot())
     DECISION_S.observe(time.perf_counter() - t0)
 
+    # Belief about the chosen worker, computed here rather than read off the
+    # Decision so it exists for every strategy (round_robin never computes one).
+    # Must be read BEFORE record(), otherwise the tracker has already been told
+    # about these blocks and would report a perfect hit every time.
+    believed_blocks = tracker.matched_blocks(decision.worker.name, hashes)
+    believed_tokens = believed_blocks * config.BLOCK_SIZE
+    believed_frac = believed_blocks / len(hashes) if hashes else 0.0
+
     # Record before the response comes back: the worker will hold these blocks
     # from the moment it starts prefill, and concurrent arrivals should already
     # see the affinity.
     tracker.record(decision.worker.name, hashes)
     CACHE_GAIN.observe(decision.cache_gain)
     ROUTED.labels(decision.worker.name, strategy.name, decision.reason).inc()
-    return decision
+    return decision, len(hashes), believed_tokens, believed_frac
 
 
 async def _proxy_stream(worker_url: str, path: str, body: bytes,
@@ -188,7 +196,7 @@ async def _handle_completion(request: Request, path: str) -> Response:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
     try:
-        decision = _choose(payload)
+        decision, n_blocks, believed_tokens, believed_frac = _choose(payload)
     except NoHealthyWorker:
         return JSONResponse({"error": "no healthy worker available"}, status_code=503)
 
@@ -197,11 +205,25 @@ async def _handle_completion(request: Request, path: str) -> Response:
     poller: MetricsPoller = state["poller"]
     poller.mark_dispatch(worker.name)
 
+    # Reported per request so the tracker's belief can be checked against what
+    # the engine actually reused (usage.prompt_tokens_details.cached_tokens).
+    # The tracker's LRU is only an approximation of the engine's eviction, and
+    # every cache_gain-driven routing result rests on that approximation being
+    # roughly right -- so it needs measuring, not assuming.
+    resp_headers = {
+        "x-router-worker": worker.name,
+        "x-router-reason": decision.reason,
+        "x-router-believed-cached-tokens": str(believed_tokens),
+        "x-router-believed-frac": f"{believed_frac:.4f}",
+        "x-router-prompt-blocks": str(n_blocks),
+        "x-router-block-size": str(config.BLOCK_SIZE),
+    }
+
     if payload.get("stream"):
         return StreamingResponse(
             _proxy_stream(worker.url, path, body, headers, worker.name),
             media_type="text/event-stream",
-            headers={"x-router-worker": worker.name, "x-router-reason": decision.reason},
+            headers=resp_headers,
         )
 
     client: httpx.AsyncClient = state["client"]
@@ -217,7 +239,7 @@ async def _handle_completion(request: Request, path: str) -> Response:
         content=upstream.content,
         status_code=upstream.status_code,
         media_type=upstream.headers.get("content-type", "application/json"),
-        headers={"x-router-worker": worker.name, "x-router-reason": decision.reason},
+        headers=resp_headers,
     )
 
 
