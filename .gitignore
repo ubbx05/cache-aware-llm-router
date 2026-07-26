@@ -1,2 +1,8 @@
-
 .venv-bench/
+__pycache__/
+corpus/
+runs/
+*.jsonl
+*.json
+train-v0.1.json
+embeddings.npy
