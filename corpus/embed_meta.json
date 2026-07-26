@@ -1,0 +1,8 @@
+{
+  "model": "intfloat/multilingual-e5-base",
+  "dim": 768,
+  "count": 2619,
+  "normalized": true,
+  "query_prefix": "query: ",
+  "passage_prefix": "passage: "
+}

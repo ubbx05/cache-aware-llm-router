@@ -1,0 +1,222 @@
+{
+  "label": "eager",
+  "worker": "http://100.89.101.52:8000",
+  "args": {
+    "compare": null,
+    "rescore": null,
+    "worker": "http://100.89.101.52:8000",
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "out": "sweep_eager.json",
+    "label": "eager",
+    "concurrency": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64
+    ],
+    "prompt_mode": "unique",
+    "prompt_tokens": 1687,
+    "max_tokens": 128,
+    "rounds": 3,
+    "min_requests": 16,
+    "cooldown": 5.0,
+    "sample_interval": 0.5,
+    "ttft_factor": 1.5,
+    "gain_threshold": 0.15,
+    "seed": 401,
+    "nonce": "run1785065621"
+  },
+  "levels": [
+    {
+      "concurrency": 1,
+      "n_ok": 15,
+      "n_err": 0,
+      "wall_s": 38.24898362199929,
+      "ttft_p50": 0.16608137200091733,
+      "ttft_p90": 0.18080004919975182,
+      "ttft_p99": 0.21529303591974894,
+      "tpot_p50_ms": 17.297884606297142,
+      "output_tok_s": 53.38125264073292,
+      "prompt_tok_s": 716.2286712015622,
+      "req_s": 0.4181299162459497,
+      "mean_total_s": 2.3916011774000556,
+      "mean_prompt_tokens": 1712.9333333333334,
+      "cache_hit_frac": 0.026267785479751914,
+      "mean_running": 0.9154929577464789,
+      "mean_waiting": 0.0,
+      "max_running": 1.0,
+      "errors": []
+    },
+    {
+      "concurrency": 2,
+      "n_ok": 14,
+      "n_err": 0,
+      "wall_s": 20.890438765,
+      "ttft_p50": 0.2537915165003142,
+      "ttft_p90": 0.357608571000128,
+      "ttft_p99": 0.37380458850011566,
+      "tpot_p50_ms": 18.461976944874593,
+      "output_tok_s": 97.70779620204902,
+      "prompt_tok_s": 1307.7686896797688,
+      "req_s": 0.763342157828508,
+      "mean_total_s": 2.620057047143096,
+      "mean_prompt_tokens": 1713.2142857142858,
+      "cache_hit_frac": 0.027989358212762855,
+      "mean_running": 1.9722222222222223,
+      "mean_waiting": 0.0,
+      "max_running": 2.0,
+      "errors": []
+    },
+    {
+      "concurrency": 4,
+      "n_ok": 12,
+      "n_err": 0,
+      "wall_s": 11.912673728998925,
+      "ttft_p50": 0.4078613130004669,
+      "ttft_p90": 0.49988656520054064,
+      "ttft_p99": 0.515778986420355,
+      "tpot_p50_ms": 19.884718102358015,
+      "output_tok_s": 174.71977536906635,
+      "prompt_tok_s": 2335.966996731215,
+      "req_s": 1.364998245070831,
+      "mean_total_s": 2.9304066979166237,
+      "mean_prompt_tokens": 1711.3333333333333,
+      "cache_hit_frac": 0.027998541742617573,
+      "mean_running": 3.7058823529411766,
+      "mean_waiting": 0.0,
+      "max_running": 4.0,
+      "errors": []
+    },
+    {
+      "concurrency": 8,
+      "n_ok": 16,
+      "n_err": 0,
+      "wall_s": 10.949232850000044,
+      "ttft_p50": 0.49445932949947746,
+      "ttft_p90": 0.6571027392004908,
+      "ttft_p99": 0.7621468843203183,
+      "tpot_p50_ms": 25.461451433064816,
+      "output_tok_s": 288.8648627681555,
+      "prompt_tok_s": 3870.5066526700384,
+      "req_s": 2.260067385961119,
+      "mean_total_s": 3.5397174658126005,
+      "mean_prompt_tokens": 1712.5625,
+      "cache_hit_frac": 0.02804762252574684,
+      "mean_running": 7.5,
+      "mean_waiting": 0.0,
+      "max_running": 8.0,
+      "errors": []
+    },
+    {
+      "concurrency": 16,
+      "n_ok": 32,
+      "n_err": 0,
+      "wall_s": 15.430779668000469,
+      "ttft_p50": 0.5691013724999721,
+      "ttft_p90": 0.8052451887007919,
+      "ttft_p99": 0.8454778449384139,
+      "tpot_p50_ms": 35.32321424016146,
+      "output_tok_s": 432.4417299039131,
+      "prompt_tok_s": 5818.51827102875,
+      "req_s": 3.3817535085349997,
+      "mean_total_s": 4.73127327571882,
+      "mean_prompt_tokens": 1720.5625,
+      "cache_hit_frac": 0.02793709303876514,
+      "mean_running": 14.9,
+      "mean_waiting": 0.0,
+      "max_running": 16.0,
+      "errors": []
+    },
+    {
+      "concurrency": 32,
+      "n_ok": 64,
+      "n_err": 0,
+      "wall_s": 23.62729316900004,
+      "ttft_p50": 0.7800144319999163,
+      "ttft_p90": 0.8380305889995725,
+      "ttft_p99": 0.8733278405009515,
+      "tpot_p50_ms": 55.15467241732368,
+      "output_tok_s": 599.9025579860875,
+      "prompt_tok_s": 8040.132399584088,
+      "req_s": 4.695910434333366,
+      "mean_total_s": 6.814440021265597,
+      "mean_prompt_tokens": 1712.15625,
+      "cache_hit_frac": 0.028028344636720295,
+      "mean_running": 30.258064516129032,
+      "mean_waiting": 0.03225806451612903,
+      "max_running": 32.0,
+      "errors": []
+    },
+    {
+      "concurrency": 64,
+      "n_ok": 128,
+      "n_err": 0,
+      "wall_s": 42.01341059799961,
+      "ttft_p50": 0.8391261995002424,
+      "ttft_p90": 1.043226690499432,
+      "ttft_p99": 1.1377466114696835,
+      "tpot_p50_ms": 100.4346269212509,
+      "output_tok_s": 717.1803492826415,
+      "prompt_tok_s": 9633.950328020996,
+      "req_s": 5.609133857275945,
+      "mean_total_s": 11.409961257562387,
+      "mean_prompt_tokens": 1717.546875,
+      "cache_hit_frac": 0.027980690408962564,
+      "mean_running": 59.6551724137931,
+      "mean_waiting": 0.22413793103448276,
+      "max_running": 64.0,
+      "errors": []
+    }
+  ],
+  "knees": {
+    "power_knee": 16,
+    "ttft_knee": 1,
+    "throughput_knee": 64,
+    "notes": [
+      "TTFT was already 1.5x baseline by c=2, the very first step -- no flat region exists, so the TTFT criterion is uninformative here and the power knee is what the recommendation uses",
+      "throughput never saturated: the last step still gained +20% (threshold 15%), so c=64 is the end of the swept range, not a knee"
+    ],
+    "power_curve": [
+      [
+        1,
+        0.1748326268598449
+      ],
+      [
+        2,
+        0.2913456249591414
+      ],
+      [
+        4,
+        0.46580505226161206
+      ],
+      [
+        8,
+        0.6384880736356406
+      ],
+      [
+        16,
+        0.7147660495305487
+      ],
+      [
+        32,
+        0.6891117127275307
+      ],
+      [
+        64,
+        0.4915997285756144
+      ]
+    ],
+    "peak_power": 0.7147660495305487,
+    "ttft_baseline_s": 0.16608137200091733,
+    "ttft_knee_upper": 2,
+    "ttft_at_knee_s": 0.16608137200091733,
+    "ttft_at_upper_s": 0.2537915165003142,
+    "ttft_factor_x": 1.5281154860577162,
+    "throughput_saturated": false,
+    "peak_output_tok_s": 717.1803492826415,
+    "mean_running_at_knee": 14.9
+  }
+}

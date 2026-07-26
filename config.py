@@ -88,9 +88,22 @@ LOAD_W_PENDING: float = _env_float("ROUTER_LOAD_W_PENDING", 1.0)
 # into pure cache affinity. The saturating form approaches 1 but never reaches
 # it, so relative differences survive at any absolute load.
 #
-# Set it near the batch size at which TTFT starts to degrade; load_norm = 0.5
-# there. Do NOT normalise against the busiest worker either: with two replicas
-# that maps any imbalance to (1.0, 0.0).
+# MEASURED, not guessed: bench/sweep_batch.py sweeps one worker at fixed
+# concurrency and locates the peak of Kleinrock power (throughput / latency).
+# On this setup (Qwen2.5-7B, ~1700-token prompts, 128 output tokens) the peak
+# sits at 16 concurrent requests, and it did NOT move between --enforce-eager
+# and CUDA-graph mode -- so this number is a property of the model/prompt shape,
+# not of the engine's execution mode.
+#
+# Do not reuse 16 on different hardware. Re-run the sweep and set this to the
+# reported power knee; that is the recipe, the number is just this setup's answer.
+#
+# Note the criterion is power, not "where TTFT starts to degrade" -- TTFT on vLLM
+# rises from the very first added request, so that phrasing has no well-defined
+# answer and naive readings of it collapse to 1.
+#
+# Do NOT normalise against the busiest worker either: with two replicas that maps
+# any imbalance to (1.0, 0.0).
 LOAD_REF: float = _env_float("ROUTER_LOAD_REF", 16.0)
 
 # --- Prefix / cache model --------------------------------------------------
