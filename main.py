@@ -21,13 +21,23 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 
 import config
 from prefix_tracker import PrefixTracker, block_hashes, get_tokenizer
-from strategies import NoHealthyWorker, RequestContext, build_strategy
+from strategies import Decision, NoHealthyWorker, RequestContext, build_strategy
 from worker_metrics import MetricsPoller
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("router")
 # One scrape line per worker per second drowns everything else during long runs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# MUST match replay.py's CHUNK_SEP exactly, byte for byte. Only replay.py's
+# --order per_worker_tree path inserts this sentinel between RAG chunks in
+# the prompt; canonical/relevance still join with plain "\n\n" (unchanged,
+# byte-identical to every prior run) so this constant existing here has zero
+# effect on any already-measured strategy. It is the only way this router can
+# tell where one chunk ends and the next begins in an already-flattened
+# prompt string, which is what lets it rewrite the chunk order server-side
+# without a second request round-trip.
+CHUNK_SEP = "\n\n<<<CHUNK>>>\n\n"
 
 # --- Router's own metrics --------------------------------------------------
 # Exported so Prometheus can scrape the router alongside the workers. The
@@ -107,6 +117,49 @@ async def _shutdown() -> None:
 
 # --- helpers ---------------------------------------------------------------
 
+def _reorder_prompt(
+    payload: dict, original_chunk_ids: list[str], new_order: list[str]
+) -> dict | None:
+    """Rewrite the system message's chunk block into `new_order`, using
+    CHUNK_SEP to find the original chunk boundaries. Returns None (do
+    nothing) on ANY mismatch -- this is the safety valve that keeps the
+    other four strategies byte-identical to every run measured so far,
+    since they never produce an ordered_chunk_ids and never reach here.
+
+    Fragile-coupling note: this assumes replay.py's exact template
+    (`f"{SYSTEM_PROMPT}\\n\\nBağlam:\\n\\n{blocks}"`). If that template
+    changes, this function must change with it -- there is no schema
+    linking the two files, only this comment.
+    """
+    if new_order == original_chunk_ids:
+        return None  # nothing to rewrite, avoid a pointless re-serialise
+
+    messages = payload.get("messages")
+    if not messages:
+        return None
+    sys_msg = next((m for m in messages if m.get("role") == "system"), None)
+    if sys_msg is None or not isinstance(sys_msg.get("content"), str):
+        return None
+
+    content = sys_msg["content"]
+    marker = "Bağlam:\n\n"
+    idx = content.find(marker)
+    if idx == -1:
+        return None
+    prefix, blocks = content[: idx + len(marker)], content[idx + len(marker):]
+
+    pieces = blocks.split(CHUNK_SEP)
+    if len(pieces) != len(original_chunk_ids):
+        return None  # sentinel absent or count mismatch -- not our request shape
+    id_to_text = dict(zip(original_chunk_ids, pieces))
+    if set(new_order) != set(original_chunk_ids):
+        return None  # reorder must be a permutation, never change the set
+
+    new_blocks = CHUNK_SEP.join(id_to_text[c] for c in new_order)
+    sys_msg["content"] = prefix + new_blocks
+    return payload
+
+
 def _prompt_text(payload: dict) -> str:
     """Flatten a request into the string whose prefix determines cache reuse.
 
@@ -138,7 +191,7 @@ def _forward_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _choose(payload: dict):
+def _choose(payload: dict, chunk_ids: list[str] | None = None, forced_worker: str | None = None):
     tokenizer = state["tokenizer"]
     tracker: PrefixTracker = state["tracker"]
     strategy = state["strategy"]
@@ -146,10 +199,22 @@ def _choose(payload: dict):
 
     text = _prompt_text(payload)
     hashes = block_hashes(tokenizer.encode(text))
-    ctx = RequestContext(prompt_text=text, block_hashes=hashes)
+    ctx = RequestContext(prompt_text=text, block_hashes=hashes, chunk_hashes=chunk_ids)
 
     t0 = time.perf_counter()
-    decision = strategy.select(ctx, poller.snapshot())
+    if forced_worker is not None:
+        # /router/decide_order already made this call (worker + ordering);
+        # this request is the follow-up completion, so we skip select() and
+        # go straight to the named worker. Metrics/tracker recording below
+        # still run, so Prometheus counters and prefix_tracker stay
+        # consistent with every other strategy's bookkeeping.
+        healthy = poller.snapshot().healthy()
+        worker = next((s for s in healthy if s.name == forced_worker), None)
+        if worker is None:
+            raise NoHealthyWorker()
+        decision = Decision(worker=worker, reason="forced_by_decide_order", scores={})
+    else:
+        decision = strategy.select(ctx, poller.snapshot())
     DECISION_S.observe(time.perf_counter() - t0)
 
     # Belief about the chosen worker, computed here rather than read off the
@@ -195,10 +260,31 @@ async def _handle_completion(request: Request, path: str) -> Response:
     except json.JSONDecodeError:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
+    _cid_header = request.headers.get("x-chunk-ids")
+    chunk_ids = _cid_header.split(",") if _cid_header else None
+    forced_worker = request.headers.get("x-router-force-worker")
+
     try:
-        decision, n_blocks, believed_tokens, believed_frac = _choose(payload)
+        decision, n_blocks, believed_tokens, believed_frac = _choose(
+            payload, chunk_ids=chunk_ids, forced_worker=forced_worker
+        )
     except NoHealthyWorker:
         return JSONResponse({"error": "no healthy worker available"}, status_code=503)
+
+    # If the strategy decided on a chunk order jointly with the worker (only
+    # per_worker_tree does this), rewrite the prompt server-side before
+    # forwarding. This only activates when: (a) the strategy actually
+    # returned an ordering, (b) the client sent x-chunk-ids so we know the
+    # ORIGINAL per-chunk boundaries, and (c) CHUNK_SEP is actually present in
+    # the system message (replay.py only inserts it for --order
+    # per_worker_tree). Any mismatch falls back to forwarding the original,
+    # unmodified body -- this must never be allowed to crash or silently
+    # corrupt a prompt for the other four strategies.
+    if decision.ordered_chunk_ids is not None and chunk_ids:
+        rewritten = _reorder_prompt(payload, chunk_ids, decision.ordered_chunk_ids)
+        if rewritten is not None:
+            payload = rewritten
+            body = json.dumps(payload).encode()
 
     worker = decision.worker
     headers = _forward_headers(request)
@@ -241,6 +327,48 @@ async def _handle_completion(request: Request, path: str) -> Response:
         media_type=upstream.headers.get("content-type", "application/json"),
         headers=resp_headers,
     )
+
+
+@app.post("/router/decide_order")
+async def decide_order(request: Request) -> Response:
+    """Two-phase entry point for strategies where the best chunk order
+    depends on which worker is chosen (currently only per_worker_tree).
+    replay.py calls this FIRST with the raw, unordered retrieval-order chunk
+    ids, gets back {worker, ordered_chunk_ids}, builds the actual prompt in
+    that order, then sends the real completion request with
+    x-router-force-worker set so /v1/chat/completions skips routing and goes
+    straight to the named worker (bookkeeping still runs normally there).
+    """
+    strategy = state["strategy"]
+    if not hasattr(strategy, "decide_order"):
+        return JSONResponse(
+            {"error": f"strategy '{strategy.name}' does not support decide_order "
+                      f"(only per_worker_tree does)"},
+            status_code=400,
+        )
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    chunk_ids = body.get("chunk_ids")
+    if not chunk_ids:
+        return JSONResponse({"error": "chunk_ids (non-empty list) required"}, status_code=400)
+
+    poller: MetricsPoller = state["poller"]
+    try:
+        decision = strategy.decide_order(chunk_ids, poller.snapshot())
+    except NoHealthyWorker:
+        return JSONResponse({"error": "no healthy worker available"}, status_code=503)
+
+    worker_url = next((w.url for w in config.WORKERS if w.name == decision.worker_name), None)
+    return JSONResponse({
+        "worker": decision.worker_name,
+        "worker_url": worker_url,
+        "ordered_chunk_ids": decision.ordered_chunk_ids,
+        "cache_gain": decision.cache_gain,
+        "scores": decision.scores,
+    })
 
 
 # --- OpenAI-compatible surface --------------------------------------------

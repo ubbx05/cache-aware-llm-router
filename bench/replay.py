@@ -108,8 +108,21 @@ class Result:
         return (self.total_s - self.ttft_s) / (self.output_tokens - 1)
 
 
+# MUST match main.py's CHUNK_SEP exactly, byte for byte -- see the comment
+# there. Only used when --order per_worker_tree; canonical/relevance keep
+# joining with plain "\n\n", so every previously-measured run (top_k A/B,
+# tracker validation, 2-worker comparison) is completely unaffected by this.
+CHUNK_SEP = "\n\n<<<CHUNK>>>\n\n"
+
+
 def retrieve(corpus: Corpus, qvec: np.ndarray, k: int, order: str) -> list[int]:
-    """Top-k by cosine similarity, then ordered according to the ablation arm."""
+    """Top-k by cosine similarity, then ordered according to the ablation arm.
+
+    per_worker_tree gets the same (unsorted-by-id) relevance order as the
+    "relevance" arm: the actual final order is decided later, per-worker, by
+    /router/decide_order. What we send here is only the retrieval-order
+    candidate set the router chooses from.
+    """
     sims = corpus.embeddings @ qvec
     top = np.argpartition(-sims, min(k, len(sims) - 1))[:k]
     top = top[np.argsort(-sims[top])]          # relevance order
@@ -118,8 +131,8 @@ def retrieve(corpus: Corpus, qvec: np.ndarray, k: int, order: str) -> list[int]:
     return top.tolist()
 
 
-def build_messages(corpus: Corpus, idxs: list[int], question: str) -> list[dict]:
-    blocks = "\n\n".join(corpus.texts[i] for i in idxs)
+def build_messages(corpus: Corpus, idxs: list[int], question: str, sep: str = "\n\n") -> list[dict]:
+    blocks = sep.join(corpus.texts[i] for i in idxs)
     return [
         {"role": "system", "content": f"{SYSTEM_PROMPT}\n\nBağlam:\n\n{blocks}"},
         {"role": "user", "content": question},
@@ -210,6 +223,105 @@ async def fire(client: httpx.AsyncClient, args, rec: dict, messages: list[dict],
     return res
 
 
+async def fire_two_phase(client: httpx.AsyncClient, args, rec: dict,
+                         id_to_text: dict[str, str], chunk_ids: list[str],
+                         question: str, t0: float) -> Result:
+    """per_worker_tree only: calls /router/decide_order FIRST with the raw
+    (retrieval-order) chunk ids, builds the prompt with the RETURNED order
+    (using CHUNK_SEP so main.py could in principle re-split it), then sends
+    the real completion with x-router-force-worker so /v1/chat/completions
+    skips select() and goes straight to the already-chosen worker. Kept as a
+    separate function from fire() on purpose -- zero risk of the extra
+    round-trip or CHUNK_SEP changing behaviour for canonical/relevance.
+    """
+    res = Result(
+        request_id=rec["request_id"],
+        session_id=rec["session_id"],
+        scheduled_s=rec["arrival_offset_s"] / args.speedup,
+        sent_s=time.perf_counter() - t0,
+        retrieved=chunk_ids,
+        expected=rec.get("expected_chunk_ids", []),
+        gold_answer=rec.get("gold_answer"),
+    )
+    res.retrieval_hit = bool(set(res.retrieved) & set(res.expected))
+
+    try:
+        dr = await client.post(f"{args.router}/router/decide_order",
+                               json={"chunk_ids": chunk_ids})
+        dr.raise_for_status()
+        decided = dr.json()
+    except Exception as exc:  # noqa: BLE001
+        res.error = f"decide_order failed: {type(exc).__name__}: {exc}"
+        return res
+
+    worker_name = decided.get("worker")
+    ordered_ids = decided.get("ordered_chunk_ids") or chunk_ids
+    blocks = CHUNK_SEP.join(id_to_text[c] for c in ordered_ids)
+    messages = [
+        {"role": "system", "content": f"{SYSTEM_PROMPT}\n\nBağlam:\n\n{blocks}"},
+        {"role": "user", "content": question},
+    ]
+
+    payload = {
+        "model": args.model,
+        "messages": messages,
+        "stream": True,
+        "max_tokens": args.max_tokens,
+        "temperature": 0.0,
+        "stream_options": {"include_usage": True},
+    }
+    headers = {
+        "x-chunk-ids": ",".join(str(c) for c in ordered_ids),
+        "x-router-force-worker": worker_name,
+    }
+
+    start = time.perf_counter()
+    try:
+        async with client.stream("POST", f"{args.router}/v1/chat/completions",
+                                 json=payload, headers=headers) as r:
+            res.worker = r.headers.get("x-router-worker")
+            res.reason = r.headers.get("x-router-reason")
+            _bt = r.headers.get("x-router-believed-cached-tokens")
+            _bf = r.headers.get("x-router-believed-frac")
+            _pb = r.headers.get("x-router-prompt-blocks")
+            res.believed_cached_tokens = int(_bt) if _bt else None
+            res.believed_frac = float(_bf) if _bf else None
+            res.prompt_blocks = int(_pb) if _pb else None
+            if r.status_code != 200:
+                await r.aread()
+                res.error = f"http {r.status_code}"
+                return res
+            async for line in r.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                body = line[6:].strip()
+                if body == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(body)
+                except json.JSONDecodeError:
+                    continue
+                usage = chunk.get("usage")
+                if usage:
+                    res.prompt_tokens = usage.get("prompt_tokens")
+                    details = usage.get("prompt_tokens_details") or {}
+                    res.actual_cached_tokens = details.get("cached_tokens")
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    if res.ttft_s is None:
+                        res.ttft_s = time.perf_counter() - start
+                    res.output_tokens += 1
+                    res.output_text += delta["content"]
+    except Exception as exc:  # noqa: BLE001
+        res.error = f"{type(exc).__name__}: {exc}"
+
+    res.total_s = time.perf_counter() - start
+    return res
+
+
 async def scrape_counters(client: httpx.AsyncClient, urls: list[str]) -> dict[str, float]:
     """Worker-side prefix cache counters, summed across workers."""
     wanted = ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_hits_total",
@@ -250,11 +362,19 @@ async def run(args) -> None:
                          batch_size=64, normalize_embeddings=True,
                          convert_to_numpy=True, show_progress_bar=True).astype("float32")
 
+    id_to_text = {cid: text for cid, text in zip(corpus.chunk_ids.tolist(), corpus.texts)}
+
     plan = []
     for rec, qv in zip(trace, qvecs):
         idxs = retrieve(corpus, qv, args.top_k, args.order)
-        plan.append((rec, build_messages(corpus, idxs, rec["query_text"]),
-                     corpus.chunk_ids[idxs].tolist()))
+        chunk_ids = corpus.chunk_ids[idxs].tolist()
+        if args.order == "per_worker_tree":
+            # Messages aren't built yet -- the final chunk order depends on
+            # which worker /router/decide_order picks, decided per-request
+            # inside fire_two_phase(), not up front here.
+            plan.append((rec, None, chunk_ids, rec["query_text"]))
+        else:
+            plan.append((rec, build_messages(corpus, idxs, rec["query_text"]), chunk_ids, None))
 
     limits = httpx.Limits(max_connections=args.max_concurrency,
                           max_keepalive_connections=args.max_concurrency)
@@ -267,12 +387,16 @@ async def run(args) -> None:
               f"top_k={args.top_k} speedup={args.speedup}x")
         t0 = time.perf_counter()
         tasks = []
-        for rec, messages, ids in plan:
+        for rec, messages, ids, question in plan:
             due = rec["arrival_offset_s"] / args.speedup
             delay = due - (time.perf_counter() - t0)
             if delay > 0:
                 await asyncio.sleep(delay)
-            tasks.append(asyncio.create_task(fire(client, args, rec, messages, ids, t0)))
+            if args.order == "per_worker_tree":
+                tasks.append(asyncio.create_task(
+                    fire_two_phase(client, args, rec, id_to_text, ids, question, t0)))
+            else:
+                tasks.append(asyncio.create_task(fire(client, args, rec, messages, ids, t0)))
         results = await asyncio.gather(*tasks)
         wall = time.perf_counter() - t0
 
@@ -334,7 +458,7 @@ def main() -> None:
     p.add_argument("--worker", action="append", default=None,
                    help="worker base URL for cache counters; repeatable")
     p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    p.add_argument("--order", choices=["canonical", "relevance"], default="canonical")
+    p.add_argument("--order", choices=["canonical", "relevance", "per_worker_tree"], default="canonical")
     p.add_argument("--top-k", type=int, default=3)
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--speedup", type=float, default=1.0,

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 import config
 from cacheweaver_dualmap_router import CacheWeaverDualMapRouter
+from per_worker_tree_router import PerWorkerDecision, PerWorkerTreeRouter
 from prefix_tracker import PrefixTracker
 from worker_metrics import Snapshot, WorkerState
 
@@ -46,6 +47,10 @@ class Decision:
     reason: str
     scores: dict[str, float]
     cache_gain: float = 0.0
+    # Set only by strategies that decide ordering jointly with worker choice
+    # (per_worker_tree). None for every other strategy -- main.py must treat
+    # None as "nothing to rewrite, forward the prompt unchanged".
+    ordered_chunk_ids: list[str] | None = None
 
 
 @dataclass
@@ -243,6 +248,73 @@ class CacheWeaverDualMapStrategy(Strategy):
         return Decision(worker=worker, reason=reason, scores={}, cache_gain=0.0)
 
 
+class PerWorkerTreeStrategy(Strategy):
+    """Worker-basina agac + iki-aday reorder tasarimi (bkz.
+    per_worker_tree_router.py). Her worker kendi CacheWeaverKnowledgeTree'sini
+    tutar; en iyi chunk sirasi WORKER SECIMINE bagli olarak degisir -- tek,
+    worker'dan bagimsiz bir "dogru sira" yok. cacheweaver_dualmap'ten farki:
+    orada n=2'de dual-hash aday secimi kanitlanmis sekilde no-op'tu (her
+    zaman {0,1}); burada hash/aday kismi hic yok, direkt karsilastirma var.
+
+    Iki giris noktasi var:
+    - decide_order(): ham chunk_ids alir, (worker, sira) doner. main.py'nin
+      /router/decide_order endpoint'i BUNU cagirir -- gercek prompt'u
+      yeniden sirasiyla kurmak icin gereken tam bilgi burada.
+    - select(): diger stratejilerle ayni Strategy arayuzunu saglamak icin
+      var (registry, genel smoke-testler). ctx.chunk_hashes main.py'nin
+      normal /v1/chat/completions akisinda artik x-chunk-ids header'indan
+      dolduruluyor (bkz. main.py _choose), yani chunk kimlikleri select()'e
+      de ulasiyor -- ama bu yoldan donen ordered_chunk_ids'in gercekten
+      uygulanmasi main.py'nin decision.ordered_chunk_ids'i okuyup prompt'u
+      yeniden yazmasina bagli (bkz. main.py _handle_completion, CHUNK_SEP).
+    """
+
+    name = "per_worker_tree"
+
+    def __init__(self, tracker: PrefixTracker):
+        super().__init__(tracker)
+        self._names = [w.name for w in config.WORKERS if w.enabled]
+        self._router = PerWorkerTreeRouter(worker_names=self._names)
+
+    def decide_order(self, chunk_ids: list[str], snap: Snapshot) -> PerWorkerDecision:
+        """Ham (siralanmamis, retrieval sirasindaki) chunk_ids alir, worker +
+        o worker'a gore en iyi sira karari doner. Dispatch-time bookkeeping
+        burada yapilir (cacheweaver_dualmap ile ayni zamanlama konvansiyonu,
+        ablation tablosunun timing farkindan degil algoritma farkindan
+        etkilenmesi icin)."""
+        healthy_names = [s.name for s in snap.healthy() if s.name in self._names]
+        if not healthy_names:
+            raise NoHealthyWorker()
+
+        loads = self._normalised_loads(snap)
+        decision = self._router.choose(
+            candidate_worker_names=healthy_names,
+            retrieved_chunk_ids=chunk_ids,
+            load_norm=loads,
+            alpha=config.ALPHA,
+            beta=config.BETA,
+        )
+        self._router.on_request_finished(decision.worker_name, decision.ordered_chunk_ids)
+        return decision
+
+    def select(self, ctx: RequestContext, snap: Snapshot) -> Decision:
+        healthy = snap.healthy()
+        if not healthy:
+            raise NoHealthyWorker()
+
+        chunk_ids = ctx.chunk_hashes or ctx.block_hashes
+        pw = self.decide_order(chunk_ids, snap)
+        worker = next((s for s in healthy if s.name == pw.worker_name), healthy[0])
+
+        return Decision(
+            worker=worker,
+            reason="per_worker_tree",
+            scores=pw.scores,
+            cache_gain=pw.cache_gain,
+            ordered_chunk_ids=pw.ordered_chunk_ids,
+        )
+
+
 class NoHealthyWorker(RuntimeError):
     pass
 
@@ -252,6 +324,7 @@ _REGISTRY: dict[str, type[Strategy]] = {
     LeastLoaded.name: LeastLoaded,
     CacheAware.name: CacheAware,
     CacheWeaverDualMapStrategy.name: CacheWeaverDualMapStrategy,
+    PerWorkerTreeStrategy.name: PerWorkerTreeStrategy,
 }
 
 
