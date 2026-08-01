@@ -1,0 +1,14 @@
+{
+  "corpus": "./corpus",
+  "out": "trace_zipf2.jsonl",
+  "n": 3000,
+  "seed": 401,
+  "zipf_s": 2.0,
+  "session_len": 4.0,
+  "think_time": 8.0,
+  "session_rate": 0.5,
+  "burst": 0.0,
+  "drift": 0.0,
+  "n_written": 3000,
+  "duration_s": 1544.43
+}
