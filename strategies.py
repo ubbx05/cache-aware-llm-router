@@ -27,6 +27,7 @@ import config
 from cacheweaver_dualmap_router import CacheWeaverDualMapRouter
 from per_worker_tree_router import PerWorkerDecision, PerWorkerTreeRouter
 from prefix_tracker import PrefixTracker
+from semantic_worker_router import SemanticWorkerRouter, real_embed
 from worker_metrics import Snapshot, WorkerState
 
 
@@ -315,6 +316,94 @@ class PerWorkerTreeStrategy(Strategy):
         )
 
 
+class SemanticPerWorkerTreeStrategy(Strategy):
+    """PerWorkerTreeStrategy + retrieval-oncesi semantik aday-on-filtresi
+    (bkz. semantic_worker_router.py, GOREV_semantic_router_entegrasyonu.md).
+
+    per_worker_tree'nin maliyeti n aday icin n*O(k^2) -- n=2'de ucuz ama
+    buyudukce pahalilasiyor. Bu strateji, PerWorkerTreeRouter.choose()'u TUM
+    healthy worker'lar yerine SADECE sorgunun icerigine gore en alakali
+    SEMANTIC_TOP_K worker'la cagirir. Aday listesi bos kalirsa (ornegin
+    semantik favoriler o an unhealthy ise) tum healthy worker'lara geri
+    duser -- bir istegi asla ac birakmaz.
+
+    SINIRLAMA -- durustce isaretlenmeli: semantic_worker_router.py'nin
+    kendi docstring'i "retrieval'dan ONCE" diyor, ama bu router'da soru
+    metni chunk'lar retrieve edildikten SONRA, zaten kurulmus prompt'un
+    icinde geliyor (main.py _prompt_text()). decide_order() bu yuzden
+    query_text'i AYRI bir parametre olarak aliyor (chunk_ids'ten degil) --
+    su an main.py'nin /router/decide_order endpoint'i bunu göndermiyor
+    (sadece chunk_ids var, bkz. main.py:354), yani query_text=None
+    gelirse semantik filtre pasif kalir ve davranis duz per_worker_tree'ye
+    esdegerdir. Bu strateji UCTAN UCA henuz vLLM/main.py uzerinden
+    dogrulanmadi -- bkz. smoke_test_semantic.py (izole, main.py'ye
+    dokunmadan dogrulama; ayni PerWorkerTreeStrategy'nin kendi
+    docstring'inde itiraf ettigi sinirlama).
+    """
+
+    name = "semantic_per_worker_tree"
+
+    def __init__(self, tracker: PrefixTracker):
+        super().__init__(tracker)
+        self._names = [w.name for w in config.WORKERS if w.enabled]
+        self._per_worker_router = PerWorkerTreeRouter(worker_names=self._names)
+        self._semantic_router = SemanticWorkerRouter(
+            worker_names=self._names, embed_fn=real_embed, lr=config.SEMANTIC_CENTROID_LR,
+        )
+
+    def decide_order(self, chunk_ids: list[str], snap: Snapshot,
+                     query_text: str | None = None) -> PerWorkerDecision:
+        healthy_names = [s.name for s in snap.healthy() if s.name in self._names]
+        if not healthy_names:
+            raise NoHealthyWorker()
+
+        if query_text:
+            pred = self._semantic_router.predict_candidates(
+                query_text, top_k=config.SEMANTIC_TOP_K
+            )
+            candidates = [n for n in pred.ranked_workers if n in healthy_names]
+            if not candidates:
+                candidates = healthy_names  # semantic favourites are down -- don't starve
+        else:
+            candidates = healthy_names
+
+        loads = self._normalised_loads(snap)
+        decision = self._per_worker_router.choose(
+            candidate_worker_names=candidates,
+            retrieved_chunk_ids=chunk_ids,
+            load_norm=loads,
+            alpha=config.ALPHA,
+            beta=config.BETA,
+        )
+        self._per_worker_router.on_request_finished(decision.worker_name, decision.ordered_chunk_ids)
+        if query_text:
+            self._semantic_router.on_request_finished(decision.worker_name, query_text)
+        return decision
+
+    def select(self, ctx: RequestContext, snap: Snapshot) -> Decision:
+        healthy = snap.healthy()
+        if not healthy:
+            raise NoHealthyWorker()
+
+        chunk_ids = ctx.chunk_hashes or ctx.block_hashes
+        # ctx.prompt_text is the flattened prompt (already includes the
+        # retrieved chunks) rather than a pre-retrieval question -- see the
+        # class docstring's SINIRLAMA note. Still the closest thing to query
+        # content this Strategy interface exposes, and good enough for the
+        # centroid signal (chunk text dominates a hashing/e5 embedding far
+        # less than the recurring question phrasing does).
+        pw = self.decide_order(chunk_ids, snap, query_text=ctx.prompt_text)
+        worker = next((s for s in healthy if s.name == pw.worker_name), healthy[0])
+
+        return Decision(
+            worker=worker,
+            reason="semantic_per_worker_tree",
+            scores=pw.scores,
+            cache_gain=pw.cache_gain,
+            ordered_chunk_ids=pw.ordered_chunk_ids,
+        )
+
+
 class NoHealthyWorker(RuntimeError):
     pass
 
@@ -325,6 +414,7 @@ _REGISTRY: dict[str, type[Strategy]] = {
     CacheAware.name: CacheAware,
     CacheWeaverDualMapStrategy.name: CacheWeaverDualMapStrategy,
     PerWorkerTreeStrategy.name: PerWorkerTreeStrategy,
+    SemanticPerWorkerTreeStrategy.name: SemanticPerWorkerTreeStrategy,
 }
 
 

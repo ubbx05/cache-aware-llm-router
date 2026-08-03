@@ -4,3 +4,6 @@ httpx>=0.27
 prometheus-client>=0.20
 # Optional: only needed when ROUTER_TOKENIZER=hf
 # transformers>=4.44
+# Optional: only needed when ROUTER_STRATEGY=semantic_per_worker_tree
+# (semantic_worker_router.py's real_embed, lazily imported)
+# sentence-transformers>=3.0

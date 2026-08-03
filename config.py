@@ -48,7 +48,8 @@ WORKERS: list[WorkerConfig] = [
 ]
 
 # --- Routing strategy ------------------------------------------------------
-# One of: round_robin | least_loaded | cache_aware
+# One of: round_robin | least_loaded | cache_aware | cacheweaver_dualmap |
+#         per_worker_tree | semantic_per_worker_tree
 STRATEGY: str = os.getenv("ROUTER_STRATEGY", "round_robin")
 
 # score(w) = ALPHA * cache_gain(w) - BETA * load(w)
@@ -105,6 +106,19 @@ LOAD_W_PENDING: float = _env_float("ROUTER_LOAD_W_PENDING", 1.0)
 # Do NOT normalise against the busiest worker either: with two replicas that maps
 # any imbalance to (1.0, 0.0).
 LOAD_REF: float = _env_float("ROUTER_LOAD_REF", 16.0)
+
+# --- Semantic pre-filter (semantic_per_worker_tree only) -------------------
+# How many workers the semantic candidate predictor hands to
+# per_worker_tree_router.choose(), instead of every healthy worker. Lower is
+# cheaper (n*O(k^2) reorder cost) but risks excluding the actual best-cache
+# worker if the centroid signal is noisy/cold.
+SEMANTIC_TOP_K: int = _env_int("ROUTER_SEMANTIC_TOP_K", 2)
+
+# EWMA learning rate for each worker's query centroid -- same role as
+# adaptive_drift_model.py's OnlineDriftEstimator.lam. Small = slow but
+# noise-resistant tracking of "what topics has this worker been serving";
+# large = reacts fast but jumpy.
+SEMANTIC_CENTROID_LR: float = _env_float("ROUTER_SEMANTIC_CENTROID_LR", 0.15)
 
 # --- Prefix / cache model --------------------------------------------------
 # vLLM hashes the KV cache in fixed-size token blocks (16 by default). The
