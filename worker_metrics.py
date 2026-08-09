@@ -57,6 +57,19 @@ class WorkerState:
     # signal into saturation.
     dispatched_since_scrape: int = 0
 
+    # Sum of prompt tokens for every request currently dispatched to this
+    # worker and not yet completed. Unlike dispatched_since_scrape, this is
+    # NOT reset on scrape -- vLLM's /metrics exposes request COUNTS
+    # (num_requests_waiting/running), never per-request token sizes, so there
+    # is no scraped signal to hand off to. This counter is the router's only
+    # source of truth for "how many tokens are actually outstanding on this
+    # worker", and it stays accurate for as long as every mark_dispatch() is
+    # paired with exactly one mark_complete() carrying the same token count
+    # (see main.py's _handle_completion/_proxy_stream). Used by
+    # CacheWeaverDualMapStrategy in place of the old
+    # num_requests_waiting * AVG_PROMPT_TOKENS_ESTIMATE guess.
+    inflight_tokens: int = 0
+
     def load(self) -> float:
         """Load(w) from the signals this engine actually moves.
 
@@ -142,14 +155,22 @@ class MetricsPoller:
     def snapshot(self) -> Snapshot:
         return Snapshot(states=self._states)
 
-    def mark_dispatch(self, name: str) -> None:
+    def mark_dispatch(self, name: str, n_tokens: int = 0) -> None:
         if name in self._states:
             self._states[name].dispatched_since_scrape += 1
+            self._states[name].inflight_tokens += n_tokens
 
-    def mark_complete(self, name: str) -> None:
-        # Completion needs no bookkeeping: the worker's own gauges reflect it at
-        # the next scrape, and dispatched_since_scrape is reset there anyway.
-        return
+    def mark_complete(self, name: str, n_tokens: int = 0) -> None:
+        # dispatched_since_scrape still needs no bookkeeping here (comment
+        # above it explains why -- the next scrape absorbs it). inflight_tokens
+        # is different: nothing scraped ever reflects it, so it is the only
+        # place this request's tokens get removed. max(0, ...) guards against
+        # drift (e.g. a mark_complete arriving for a request whose worker was
+        # reset/restarted mid-flight) turning into a permanently negative,
+        # nonsensical load reading.
+        if name in self._states:
+            s = self._states[name]
+            s.inflight_tokens = max(0, s.inflight_tokens - n_tokens)
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._loop())

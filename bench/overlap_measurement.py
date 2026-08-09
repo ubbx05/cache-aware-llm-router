@@ -27,8 +27,16 @@ import json
 import statistics
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from replay import Corpus, retrieve
+# `replay` is imported lazily (inside the functions that need it, below)
+# rather than here at module scope. jaccard() itself is stdlib-only and is
+# now reused directly by strategies.py's overlap-adaptive alpha/beta (Adim
+# 3) -- a top-level `from replay import ...` would drag replay's numpy/httpx
+# dependency chain into the production router process just to reach a
+# three-line set operation. This file's own CLI behaviour is unchanged.
+if TYPE_CHECKING:
+    from replay import Corpus
 
 
 def jaccard(a: set[int], b: set[int]) -> float:
@@ -44,7 +52,8 @@ def load_trace(path: Path, limit: int) -> list[dict]:
     return trace
 
 
-def retrieved_sets(corpus: Corpus, trace: list[dict], args) -> list[set[int]]:
+def retrieved_sets(corpus: "Corpus", trace: list[dict], args) -> list[set[int]]:
+    from replay import retrieve
     from sentence_transformers import SentenceTransformer
 
     print(f"embedding {len(trace)} queries on {args.device} ...")
@@ -92,6 +101,8 @@ def report(name: str, scores: list[float]) -> None:
 
 
 def run(args) -> None:
+    from replay import Corpus
+
     corpus = Corpus.load(Path(args.corpus))
     trace = load_trace(Path(args.trace), args.limit)
     if not trace:

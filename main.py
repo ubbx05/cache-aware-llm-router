@@ -243,7 +243,8 @@ def _choose(payload: dict, chunk_ids: list[str] | None = None,
 async def _proxy_stream(worker_url: str, path: str, body: bytes,
                         headers: dict[str, str], worker_name: str,
                         tracker: PrefixTracker | None = None,
-                        hashes: list[str] | None = None) -> AsyncIterator[bytes]:
+                        hashes: list[str] | None = None,
+                        n_tokens: int = 0) -> AsyncIterator[bytes]:
     client: httpx.AsyncClient = state["client"]
     poller: MetricsPoller = state["poller"]
     try:
@@ -264,7 +265,10 @@ async def _proxy_stream(worker_url: str, path: str, body: bytes,
         log.warning("stream failed on %s: %s", worker_name, exc)
         yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode()
     finally:
-        poller.mark_complete(worker_name)
+        # n_tokens must match what mark_dispatch() was called with for this
+        # same request (bkz. _handle_completion) -- it undoes exactly that
+        # addition to inflight_tokens, not a freshly recomputed value.
+        poller.mark_complete(worker_name, n_tokens)
 
 
 async def _handle_completion(request: Request, path: str) -> Response:
@@ -304,7 +308,13 @@ async def _handle_completion(request: Request, path: str) -> Response:
     worker = decision.worker
     headers = _forward_headers(request)
     poller: MetricsPoller = state["poller"]
-    poller.mark_dispatch(worker.name)
+    # n_blocks * BLOCK_SIZE is a real (block-floored) prompt token count --
+    # already computed inside _choose() via the router's own tokenizer, not
+    # re-tokenized here. Feeds WorkerState.inflight_tokens, which
+    # CacheWeaverDualMapStrategy reads in place of the old
+    # num_requests_waiting * AVG_PROMPT_TOKENS_ESTIMATE guess.
+    prompt_tokens_est = n_blocks * config.BLOCK_SIZE
+    poller.mark_dispatch(worker.name, prompt_tokens_est)
 
     # Reported per request so the tracker's belief can be checked against what
     # the engine actually reused (usage.prompt_tokens_details.cached_tokens).
@@ -323,7 +333,8 @@ async def _handle_completion(request: Request, path: str) -> Response:
     if payload.get("stream"):
         return StreamingResponse(
             _proxy_stream(worker.url, path, body, headers, worker.name,
-                         tracker=state["tracker"], hashes=hashes),
+                         tracker=state["tracker"], hashes=hashes,
+                         n_tokens=prompt_tokens_est),
             media_type="text/event-stream",
             headers=resp_headers,
         )
@@ -333,10 +344,10 @@ async def _handle_completion(request: Request, path: str) -> Response:
         upstream = await client.post(f"{worker.url}{path}", content=body, headers=headers)
     except Exception as exc:  # noqa: BLE001
         UPSTREAM_ERRORS.labels(worker.name).inc()
-        poller.mark_complete(worker.name)
+        poller.mark_complete(worker.name, prompt_tokens_est)
         return JSONResponse({"error": f"upstream failure: {exc}"}, status_code=502)
 
-    poller.mark_complete(worker.name)
+    poller.mark_complete(worker.name, prompt_tokens_est)
     if config.TRACKER_TIMING == "completion":
         state["tracker"].record(worker.name, hashes)
     return Response(

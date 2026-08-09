@@ -107,6 +107,27 @@ LOAD_W_PENDING: float = _env_float("ROUTER_LOAD_W_PENDING", 1.0)
 # any imbalance to (1.0, 0.0).
 LOAD_REF: float = _env_float("ROUTER_LOAD_REF", 16.0)
 
+# --- Overlap-adaptive alpha/beta (per_worker_tree only) --------------------
+# Simple threshold switch, NOT an EWMA/CUSUM estimator (that mechanism was
+# scoped OUT of this task deliberately -- see adaptive_drift_model.py for the
+# more elaborate version, which this does not replace or depend on). Off by
+# default so every existing strategy comparison stays byte-for-byte
+# reproducible; flip it on to compare "Per-Worker Joint" against "Per-Worker
+# Joint + Adaptive" in the ablation table.
+OVERLAP_ADAPTIVE_ENABLED: bool = _env_bool("ROUTER_OVERLAP_ADAPTIVE", False)
+
+# Consecutive-request Jaccard overlap (bench/overlap_measurement.py's
+# definition, |A∩B|/|A∪B|) below this counts as "low overlap": the previous
+# request's retrieved chunks barely predict this one's, so cache affinity is
+# a weak signal and the load term should dominate.
+OVERLAP_THRESHOLD: float = _env_float("ROUTER_OVERLAP_THRESHOLD", 0.3)
+
+# alpha when overlap < OVERLAP_THRESHOLD / >= OVERLAP_THRESHOLD. beta is each
+# alpha's complement (beta = 1 - alpha) -- this scheme has one free
+# parameter per regime, not two, by design (bkz. strategies.adaptive_weights).
+LOW_OVERLAP_ALPHA: float = _env_float("ROUTER_LOW_OVERLAP_ALPHA", 0.2)
+HIGH_OVERLAP_ALPHA: float = _env_float("ROUTER_HIGH_OVERLAP_ALPHA", 0.8)
+
 # --- Semantic pre-filter (semantic_per_worker_tree only) -------------------
 # How many workers the semantic candidate predictor hands to
 # per_worker_tree_router.choose(), instead of every healthy worker. Lower is

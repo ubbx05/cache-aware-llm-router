@@ -303,6 +303,14 @@ class CacheWeaverDualMapStrategy(Strategy):
     CACHEWEAVER_TTFT_SLO_THRESHOLD_TOKENS in config.py. Re-measure if top_k
     or the prompt template changes; this is a workload property, not a
     router property.
+
+    (An alternative to this estimate -- WorkerState.inflight_tokens, a real
+    per-worker running total of dispatched-but-not-completed prompt tokens,
+    fed by main.py's mark_dispatch/mark_complete -- was tried in a parallel
+    branch and is still wired through worker_metrics.py/main.py. This class
+    uses the calibrated-estimate version instead by team decision; the real
+    counter is dormant but harmless, and is available if this estimate ever
+    needs replacing again.)
     """
 
     name = "cacheweaver_dualmap"
@@ -358,6 +366,27 @@ class CacheWeaverDualMapStrategy(Strategy):
         return Decision(worker=worker, reason=reason, scores={}, cache_gain=0.0)
 
 
+def adaptive_weights(
+    overlap: float,
+    threshold: float = 0.3,
+    low_alpha: float = 0.2,
+    high_alpha: float = 0.8,
+) -> tuple[float, float]:
+    """Deliberately simple threshold switch -- NOT an EWMA/CUSUM estimator
+    (that mechanism, adaptive_drift_model.py, was scoped OUT of this task).
+
+    overlap: Jaccard(previous request's retrieved chunks, this request's) --
+    same definition as bench/overlap_measurement.py's jaccard(), a single
+    consecutive-pair comparison, not a rolling window. Below `threshold`,
+    cache affinity is a weak signal (the last request barely predicts this
+    one), so alpha drops and the load term dominates; at/above threshold,
+    cache affinity is trusted more. beta is each alpha's complement -- one
+    free parameter per regime, not two.
+    """
+    alpha = low_alpha if overlap < threshold else high_alpha
+    return alpha, 1.0 - alpha
+
+
 class PerWorkerTreeStrategy(Strategy):
     """Worker-basina agac + iki-aday reorder tasarimi (bkz.
     per_worker_tree_router.py). Her worker kendi CacheWeaverKnowledgeTree'sini
@@ -377,6 +406,15 @@ class PerWorkerTreeStrategy(Strategy):
       de ulasiyor -- ama bu yoldan donen ordered_chunk_ids'in gercekten
       uygulanmasi main.py'nin decision.ordered_chunk_ids'i okuyup prompt'u
       yeniden yazmasina bagli (bkz. main.py _handle_completion, CHUNK_SEP).
+
+    Overlap-adaptive alpha/beta (config.OVERLAP_ADAPTIVE_ENABLED, varsayilan
+    KAPALI): acikken, her decide_order() cagrisinda bu isteğin chunk_ids'i
+    ile BIR ONCEKI cagrinin chunk_ids'i arasindaki Jaccard hesaplanir (bkz.
+    adaptive_weights() yukarida, jaccard() bench/overlap_measurement.py'den
+    import edildi -- yeniden yazilmadi) ve config.ALPHA/BETA yerine bu
+    ölçüme gore secilen alpha/beta kullanilir. KAPALIYKEN davranis eskisiyle
+    BIREBIR ayni -- config.ALPHA/BETA sabitleri degismeden kullanilir, ne
+    self._prev_chunk_ids okunur ne de jaccard() cagrilir.
     """
 
     name = "per_worker_tree"
@@ -385,6 +423,7 @@ class PerWorkerTreeStrategy(Strategy):
         super().__init__(tracker)
         self._names = [w.name for w in config.WORKERS if w.enabled]
         self._router = PerWorkerTreeRouter(worker_names=self._names)
+        self._prev_chunk_ids: set[str] | None = None  # sadece OVERLAP_ADAPTIVE_ENABLED iken kullanilir
 
     def decide_order(self, chunk_ids: list[str], snap: Snapshot) -> PerWorkerDecision:
         """Ham (siralanmamis, retrieval sirasindaki) chunk_ids alir, worker +
@@ -396,13 +435,25 @@ class PerWorkerTreeStrategy(Strategy):
         if not healthy_names:
             raise NoHealthyWorker()
 
+        if config.OVERLAP_ADAPTIVE_ENABLED:
+            from bench.overlap_measurement import jaccard
+
+            overlap = jaccard(self._prev_chunk_ids or set(), set(chunk_ids))
+            alpha, beta = adaptive_weights(
+                overlap, config.OVERLAP_THRESHOLD,
+                config.LOW_OVERLAP_ALPHA, config.HIGH_OVERLAP_ALPHA,
+            )
+            self._prev_chunk_ids = set(chunk_ids)
+        else:
+            alpha, beta = config.ALPHA, config.BETA
+
         loads = self._normalised_loads(snap)
         decision = self._router.choose(
             candidate_worker_names=healthy_names,
             retrieved_chunk_ids=chunk_ids,
             load_norm=loads,
-            alpha=config.ALPHA,
-            beta=config.BETA,
+            alpha=alpha,
+            beta=beta,
         )
         self._router.on_request_finished(decision.worker_name, decision.ordered_chunk_ids)
         return decision
