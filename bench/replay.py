@@ -167,7 +167,10 @@ async def fire(client: httpx.AsyncClient, args, rec: dict, messages: list[dict],
     # Chunk ids travel alongside the request so a chunk-coverage strategy can use
     # them directly. Under canonical ordering the router does not need them --
     # prefix matching on the ordered prompt already captures chunk overlap.
-    headers = {"x-chunk-ids": ",".join(str(c) for c in retrieved_ids)}
+    headers = {
+        "x-chunk-ids": ",".join(str(c) for c in retrieved_ids),
+        "x-session-id": str(rec["session_id"]),
+    }
 
     start = time.perf_counter()
     try:
@@ -273,6 +276,7 @@ async def fire_two_phase(client: httpx.AsyncClient, args, rec: dict,
     headers = {
         "x-chunk-ids": ",".join(str(c) for c in ordered_ids),
         "x-router-force-worker": worker_name,
+        "x-session-id": str(rec["session_id"]),
     }
 
     start = time.perf_counter()

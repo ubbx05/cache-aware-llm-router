@@ -48,8 +48,8 @@ WORKERS: list[WorkerConfig] = [
 ]
 
 # --- Routing strategy ------------------------------------------------------
-# One of: round_robin | least_loaded | cache_aware | cacheweaver_dualmap |
-#         per_worker_tree | semantic_per_worker_tree
+# One of: round_robin | least_loaded | cache_aware | adaptive_cache_aware |
+#         cacheweaver_dualmap | per_worker_tree | semantic_per_worker_tree
 STRATEGY: str = os.getenv("ROUTER_STRATEGY", "round_robin")
 
 # score(w) = ALPHA * cache_gain(w) - BETA * load(w)
@@ -119,6 +119,59 @@ SEMANTIC_TOP_K: int = _env_int("ROUTER_SEMANTIC_TOP_K", 2)
 # noise-resistant tracking of "what topics has this worker been serving";
 # large = reacts fast but jumpy.
 SEMANTIC_CENTROID_LR: float = _env_float("ROUTER_SEMANTIC_CENTROID_LR", 0.15)
+
+# --- Adaptive beta/delta via drift detection (adaptive_cache_aware only) ---
+# See adaptive_drift_model.py. The router observes session-adjacent retrieved-
+# chunk-set Jaccard overlap live (needs x-session-id from replay.py) and feeds
+# it through an EWMA + CUSUM pair to decide when locality has genuinely
+# shifted, then scales BETA/DELTA0 accordingly instead of leaving them fixed.
+#
+# D_TARGET is the "normal" (pre-drift) session-adjacent overlap the detector
+# compares live readings against. MEASURED, not guessed -- same discipline as
+# LOAD_REF: run bench/overlap_measurement.py on your trace and use its
+# session-adjacent mean. On trace_hot.jsonl (zipf-s=1.5, session-len=4) that
+# was 0.529 (800 queries, 2026-07-30) -- re-measure for any other trace shape,
+# this number is a property of the workload, not the router.
+D_TARGET: float = _env_float("ROUTER_D_TARGET", 0.529)
+
+# EWMA learning rate for the live overlap estimate (OnlineDriftEstimator.lam).
+DRIFT_LAM: float = _env_float("ROUTER_DRIFT_LAM", 0.1)
+
+# CUSUM sensitivity margin and alarm threshold (CusumDriftDetector.k / .h).
+# Defaults are adaptive_drift_model.py's own self-test values, not yet
+# calibrated against a real multi-thousand-request live run -- see the open
+# item in today's report.
+CUSUM_K: float = _env_float("ROUTER_CUSUM_K", 0.03)
+CUSUM_H: float = _env_float("ROUTER_CUSUM_H", 0.20)
+
+# --- cacheweaver_dualmap baseline thresholds --------------------------------
+# CacheWeaverDualMapRouter's own defaults (20_000 / 30_000) are borrowed from
+# DualMap's paper hardware, not measured on this setup -- same class of gap
+# as an uncalibrated LOAD_REF. MEASURED, not guessed: mean prompt_tokens on
+# this workload (top_k=10, RAG) was 2392 (n=800, runs/ca_r1.jsonl,
+# 2026-08-13); threshold = LOAD_REF * mean_prompt_tokens, same recipe as
+# LOAD_REF itself. rebalance keeps DualMap's own 30_000/20_000 = 1.5x ratio.
+# Re-measure if top_k, corpus, or prompt template changes.
+CACHEWEAVER_TTFT_SLO_THRESHOLD_TOKENS: int = _env_int(
+    "ROUTER_CACHEWEAVER_TTFT_SLO_THRESHOLD_TOKENS", 38_272
+)
+CACHEWEAVER_REBALANCE_THRESHOLD_TOKENS: int = _env_int(
+    "ROUTER_CACHEWEAVER_REBALANCE_THRESHOLD_TOKENS", 57_408
+)
+
+# --- Tracker bookkeeping timing ---------------------------------------------
+# "dispatch": tracker.record() runs the moment a worker is chosen, before the
+# response comes back -- optimistic (concurrent arrivals see the affinity
+# immediately) but can overestimate under heavy concurrency (Faz 1, 2026-07-26:
+# correlation 0.415 at speedup=20 vs 0.532 at speedup=1, same trace/capacity).
+# "completion": tracker.record() runs only after the response has actually
+# finished streaming back successfully -- never overestimates, but a burst of
+# concurrent identical requests won't see each other's affinity in time.
+# This was previously only observed as a side effect of a concurrency sweep;
+# TRACKER_TIMING makes it a first-class, directly comparable toggle.
+TRACKER_TIMING: str = os.getenv("ROUTER_TRACKER_TIMING", "dispatch")
+if TRACKER_TIMING not in ("dispatch", "completion"):
+    raise ValueError(f"ROUTER_TRACKER_TIMING must be 'dispatch' or 'completion', got {TRACKER_TIMING!r}")
 
 # --- Prefix / cache model --------------------------------------------------
 # vLLM hashes the KV cache in fixed-size token blocks (16 by default). The

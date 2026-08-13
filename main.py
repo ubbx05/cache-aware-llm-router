@@ -191,7 +191,8 @@ def _forward_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _choose(payload: dict, chunk_ids: list[str] | None = None, forced_worker: str | None = None):
+def _choose(payload: dict, chunk_ids: list[str] | None = None,
+           forced_worker: str | None = None, session_id: str | None = None):
     tokenizer = state["tokenizer"]
     tracker: PrefixTracker = state["tracker"]
     strategy = state["strategy"]
@@ -199,7 +200,8 @@ def _choose(payload: dict, chunk_ids: list[str] | None = None, forced_worker: st
 
     text = _prompt_text(payload)
     hashes = block_hashes(tokenizer.encode(text))
-    ctx = RequestContext(prompt_text=text, block_hashes=hashes, chunk_hashes=chunk_ids)
+    ctx = RequestContext(prompt_text=text, block_hashes=hashes, chunk_hashes=chunk_ids,
+                         session_id=session_id)
 
     t0 = time.perf_counter()
     if forced_worker is not None:
@@ -227,15 +229,21 @@ def _choose(payload: dict, chunk_ids: list[str] | None = None, forced_worker: st
 
     # Record before the response comes back: the worker will hold these blocks
     # from the moment it starts prefill, and concurrent arrivals should already
-    # see the affinity.
-    tracker.record(decision.worker.name, hashes)
+    # see the affinity. Only when TRACKER_TIMING="dispatch" (the default,
+    # matches every prior measurement in this project) -- "completion" mode
+    # records later, in _proxy_stream / the non-streaming path below, only
+    # once the response has actually finished.
+    if config.TRACKER_TIMING == "dispatch":
+        tracker.record(decision.worker.name, hashes)
     CACHE_GAIN.observe(decision.cache_gain)
     ROUTED.labels(decision.worker.name, strategy.name, decision.reason).inc()
-    return decision, len(hashes), believed_tokens, believed_frac
+    return decision, len(hashes), believed_tokens, believed_frac, hashes
 
 
 async def _proxy_stream(worker_url: str, path: str, body: bytes,
-                        headers: dict[str, str], worker_name: str) -> AsyncIterator[bytes]:
+                        headers: dict[str, str], worker_name: str,
+                        tracker: PrefixTracker | None = None,
+                        hashes: list[str] | None = None) -> AsyncIterator[bytes]:
     client: httpx.AsyncClient = state["client"]
     poller: MetricsPoller = state["poller"]
     try:
@@ -245,6 +253,12 @@ async def _proxy_stream(worker_url: str, path: str, body: bytes,
             # aiter_raw avoids any decoding/re-encoding of the SSE frames.
             async for chunk in upstream.aiter_raw():
                 yield chunk
+        # Reached only if the stream finished without raising -- i.e. the
+        # response genuinely completed. completion-mode records here, not in
+        # the except branch: a request that errored never actually got these
+        # blocks served, so it should not be credited as a cache contributor.
+        if config.TRACKER_TIMING == "completion" and tracker is not None and hashes is not None:
+            tracker.record(worker_name, hashes)
     except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error
         UPSTREAM_ERRORS.labels(worker_name).inc()
         log.warning("stream failed on %s: %s", worker_name, exc)
@@ -263,10 +277,11 @@ async def _handle_completion(request: Request, path: str) -> Response:
     _cid_header = request.headers.get("x-chunk-ids")
     chunk_ids = _cid_header.split(",") if _cid_header else None
     forced_worker = request.headers.get("x-router-force-worker")
+    session_id = request.headers.get("x-session-id")
 
     try:
-        decision, n_blocks, believed_tokens, believed_frac = _choose(
-            payload, chunk_ids=chunk_ids, forced_worker=forced_worker
+        decision, n_blocks, believed_tokens, believed_frac, hashes = _choose(
+            payload, chunk_ids=chunk_ids, forced_worker=forced_worker, session_id=session_id
         )
     except NoHealthyWorker:
         return JSONResponse({"error": "no healthy worker available"}, status_code=503)
@@ -307,7 +322,8 @@ async def _handle_completion(request: Request, path: str) -> Response:
 
     if payload.get("stream"):
         return StreamingResponse(
-            _proxy_stream(worker.url, path, body, headers, worker.name),
+            _proxy_stream(worker.url, path, body, headers, worker.name,
+                         tracker=state["tracker"], hashes=hashes),
             media_type="text/event-stream",
             headers=resp_headers,
         )
@@ -321,6 +337,8 @@ async def _handle_completion(request: Request, path: str) -> Response:
         return JSONResponse({"error": f"upstream failure: {exc}"}, status_code=502)
 
     poller.mark_complete(worker.name)
+    if config.TRACKER_TIMING == "completion":
+        state["tracker"].record(worker.name, hashes)
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,

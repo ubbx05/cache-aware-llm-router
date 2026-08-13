@@ -34,13 +34,17 @@ snap = make_snapshot(w1_running=0, w2_running=0)
 decision = strategy.select(ctx, snap)
 print(f"secilen: {decision.worker.name}, sebep: {decision.reason}")
 tracker.record(decision.worker.name, hashes)
+cache_holder = decision.worker.name  # tie broken randomly (bkz. _argmax) -- kaydet, sabit "w1" varsayma
 
-print("\n== Test 2: ayni prefix'in devami, w1'de cache var, yukler esit -> w1 kazanmali ==")
+print("\n== Test 2: ayni prefix'in devami, esit yuk -> cache'i tutan worker kazanmali ==")
 ctx2, hashes2 = ctx_for(prompt_a_devam)
 snap2 = make_snapshot(w1_running=0, w2_running=0)
 decision2 = strategy.select(ctx2, snap2)
 print(f"secilen: {decision2.worker.name}, sebep: {decision2.reason}, cache_gain={decision2.cache_gain:.2f}")
-assert decision2.worker.name == "w1", "beklenen: cache'i tutan worker kazanmali"
+assert decision2.worker.name == cache_holder, (
+    f"beklenen: Test 1'de cache'i tutan worker ({cache_holder}) kazanmali, "
+    f"gelen: {decision2.worker.name}"
+)
 
 print("\n== Test 3: ayni prefix ama w1 asiri yuklu -> guard band devreye girip w2'ye dusmeli ==")
 snap3 = make_snapshot(w1_running=50, w2_running=0)

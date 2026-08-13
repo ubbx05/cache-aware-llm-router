@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import config
+from adaptive_drift_model import CusumDriftDetector, OnlineDriftEstimator, adaptive_beta, adaptive_delta
 from cacheweaver_dualmap_router import CacheWeaverDualMapRouter
 from per_worker_tree_router import PerWorkerDecision, PerWorkerTreeRouter
 from prefix_tracker import PrefixTracker
@@ -60,6 +61,10 @@ class RequestContext:
     prompt_text: str
     block_hashes: list[str]
     chunk_hashes: list[str] | None = None  # populated in the RAG phase
+    # From the x-session-id header (replay.py). None for any client that
+    # doesn't send it -- every existing strategy ignores this field, so its
+    # absence changes nothing for them.
+    session_id: str | None = None
 
 
 class Strategy(ABC):
@@ -177,6 +182,106 @@ class CacheAware(Strategy):
         )
 
 
+def _jaccard_sets(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+class AdaptiveCacheAware(CacheAware):
+    """CacheAware + live drift-adaptive beta/delta (adaptive_drift_model.py).
+
+    Deliberately a SIBLING of CacheAware, not a modification -- CacheAware's
+    own select() is never touched, so every measurement already taken
+    against it (calibration, ablations, 2-worker comparison) stays valid and
+    comparable. This class overrides select() completely rather than trying
+    to parameterise the parent.
+
+    Needs ctx.session_id (x-session-id header, added to replay.py) to compute
+    a SESSION-ADJACENT retrieved-chunk-set Jaccard signal. This is not a
+    stylistic choice: bench/overlap_measurement.py measured session-adjacent
+    overlap at mean=0.529 vs global-adjacent (no session grouping) at
+    mean=0.178, median=0.000, nonzero=19.8% (trace_hot.jsonl, 800 queries,
+    2026-07-30) -- global-adjacent is mostly reading noise, not signal, and
+    would make the CUSUM detector nearly useless. If a client never sends
+    x-session-id (or every session is still on its first turn), this
+    degrades gracefully to CacheAware's exact fixed BETA/DELTA0 formula
+    rather than guessing or crashing.
+
+    Dispatch-time convention: the drift estimator/detector are updated here,
+    inside select(), at the same point every other adaptive strategy in this
+    file does its bookkeeping -- keeps the ablation timing-comparable.
+    """
+
+    name = "adaptive_cache_aware"
+
+    def __init__(self, tracker: PrefixTracker):
+        super().__init__(tracker)
+        self._estimator = OnlineDriftEstimator(lam=config.DRIFT_LAM)
+        self._detector = CusumDriftDetector(
+            d_ref=config.D_TARGET, k=config.CUSUM_K, h=config.CUSUM_H
+        )
+        self._last_chunk_set_by_session: dict[str, set] = {}
+
+    def select(self, ctx: RequestContext, snap: Snapshot) -> Decision:
+        healthy = snap.healthy()
+        if not healthy:
+            raise NoHealthyWorker()
+
+        loads = self._normalised_loads(snap)
+        gains = {
+            s.name: self.tracker.prefix_gain(s.name, ctx.block_hashes)
+            for s in healthy
+        }
+
+        if ctx.session_id is not None:
+            chunk_ids = ctx.chunk_hashes or ctx.block_hashes
+            current_set = set(chunk_ids) if chunk_ids else set()
+            prev_set = self._last_chunk_set_by_session.get(ctx.session_id)
+            if prev_set is not None:
+                jaccard = _jaccard_sets(current_set, prev_set)
+                d_t = self._estimator.update(jaccard)
+                self._detector.update(jaccard, current_ewma_estimate=d_t)
+            self._last_chunk_set_by_session[ctx.session_id] = current_set
+
+        # _d_t (not the .current property) is the only way to distinguish
+        # "never observed anything yet" from "observed exactly 0.0 overlap" --
+        # adaptive_drift_model.py doesn't expose this as a public flag; reaching
+        # into the private field is the same accepted-debt pattern as
+        # cacheweaver_dualmap_router.py's `tree._root` (see its own comment).
+        warmed_up = self._estimator._d_t is not None
+        if warmed_up:
+            d_t = self._estimator.current
+            effective_beta = adaptive_beta(config.BETA, d_t, config.D_TARGET)
+            delta = adaptive_delta(config.DELTA0, snap.mean_kv_usage(), d_t, config.D_TARGET)
+        else:
+            effective_beta = config.BETA
+            delta = config.DELTA0 * (1.0 - snap.mean_kv_usage())
+
+        scores = {
+            s.name: config.ALPHA * gains[s.name] - effective_beta * loads[s.name]
+            for s in healthy
+        }
+        best = _argmax(healthy, scores)
+
+        min_load = min(loads.values())
+        if loads[best.name] > min_load + delta:
+            fallback = _argmax(healthy, {n: -v for n, v in loads.items()})
+            return Decision(
+                worker=fallback,
+                reason=f"guard_band(delta={delta:.3f},beta={effective_beta:.3f})",
+                scores=scores,
+                cache_gain=gains[fallback.name],
+            )
+
+        return Decision(
+            worker=best,
+            reason=f"score(beta={effective_beta:.3f})",
+            scores=scores,
+            cache_gain=gains[best.name],
+        )
+
+
 class CacheWeaverDualMapStrategy(Strategy):
     """Baseline: CacheWeaver greedy-reorder + DualMap dual-hash/SLO/hotspot
     hybrid (cacheweaver_dualmap_router.py), wrapped to fit this router's
@@ -190,19 +295,19 @@ class CacheWeaverDualMapStrategy(Strategy):
     If you want to characterise dispatch-vs-completion as its own axis later,
     apply the same change to BOTH strategies, not just this one.
 
-    Units caveat: DualMap's ReplicaState.num_pending_prefill_tokens wants a
+    Units note: DualMap's ReplicaState.num_pending_prefill_tokens wants a
     TOKEN count, but this router only exposes request-level queue depth
-    (num_requests_waiting). AVG_PROMPT_TOKENS_ESTIMATE below is a placeholder
-    conversion -- replace it with a number you actually measured (e.g. mean
-    prompt_tokens from a validate_tracker.py run) before trusting any TTFT
-    estimate this strategy produces.
+    (num_requests_waiting). AVG_PROMPT_TOKENS_ESTIMATE converts one to the
+    other; MEASURED (mean prompt_tokens, n=800, runs/ca_r1.jsonl, top_k=10,
+    2026-08-13) rather than guessed -- same number used to calibrate
+    CACHEWEAVER_TTFT_SLO_THRESHOLD_TOKENS in config.py. Re-measure if top_k
+    or the prompt template changes; this is a workload property, not a
+    router property.
     """
 
     name = "cacheweaver_dualmap"
 
-    # TODO(kalibrasyon): placeholder, gercek RAG promptlarinin ortalama token
-    # sayisiyla degistir (validate_tracker.py ciktisindaki "prompt ort" satiri).
-    AVG_PROMPT_TOKENS_ESTIMATE = 1700
+    AVG_PROMPT_TOKENS_ESTIMATE = 2392
 
     def __init__(self, tracker: PrefixTracker):
         super().__init__(tracker)
@@ -210,7 +315,11 @@ class CacheWeaverDualMapStrategy(Strategy):
         # calls even if a worker briefly drops out of snap.healthy().
         self._names = [w.name for w in config.WORKERS if w.enabled]
         self._name_to_idx = {name: i for i, name in enumerate(self._names)}
-        self._router = CacheWeaverDualMapRouter(num_replicas=len(self._names))
+        self._router = CacheWeaverDualMapRouter(
+            num_replicas=len(self._names),
+            ttft_slo_threshold_tokens=config.CACHEWEAVER_TTFT_SLO_THRESHOLD_TOKENS,
+            rebalance_threshold_tokens=config.CACHEWEAVER_REBALANCE_THRESHOLD_TOKENS,
+        )
         self._req_counter = itertools.count()
 
     def select(self, ctx: RequestContext, snap: Snapshot) -> Decision:
@@ -412,6 +521,7 @@ _REGISTRY: dict[str, type[Strategy]] = {
     RoundRobin.name: RoundRobin,
     LeastLoaded.name: LeastLoaded,
     CacheAware.name: CacheAware,
+    AdaptiveCacheAware.name: AdaptiveCacheAware,
     CacheWeaverDualMapStrategy.name: CacheWeaverDualMapStrategy,
     PerWorkerTreeStrategy.name: PerWorkerTreeStrategy,
     SemanticPerWorkerTreeStrategy.name: SemanticPerWorkerTreeStrategy,
