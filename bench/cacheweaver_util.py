@@ -101,8 +101,23 @@ class CacheWeaverKnowledgeTree:
     # ------------------------------------------------------------------
     # Greedy reorder: Algoritma 1
     # ------------------------------------------------------------------
-    def greedy_reorder(self, retrieved_chunk_ids: Sequence[ChunkId]) -> List[ChunkId]:
-        """CacheWeaver Algoritma 1'in birebir karşılığı.
+    def greedy_reorder(
+        self, retrieved_chunk_ids: Sequence[ChunkId], protect_top_k: int = 0
+    ) -> List[ChunkId]:
+        """CacheWeaver Algoritma 1'in birebir karşılığı, artı opsiyonel bir
+        kalite-koruma parametresi.
+
+        protect_top_k: retrieval sırasındaki İLK K chunk'ı (en alakalı
+        kabul edilenler) OLDUĞU YERDE bırakır -- cache durumuna bakmadan.
+        Sadece K'dan sonraki chunk'lar cache-dostu şekilde yeniden dizilir.
+        K=0 (varsayılan): eski davranış, TAMAMEN değişmez.
+
+        Neden gerekli: saf greedy reorder, çok alakalı ama cache'de olmayan
+        bir chunk'ı sona itebilir, az alakalı ama cache'de olan bir chunk'ı
+        öne çıkarabilir -- CacheWeaver'ın kendi makalesi bile bunun cevap
+        kalitesini etkileme RİSKİNİ tam kapatmadığını kabul ediyor (Tablo 7,
+        "dar bir iddia... sıranın HİÇBİR ZAMAN önemli olmadığını kanıtlamıyor").
+        protect_top_k, bu riski basit bir üst sınırla sınırlıyor.
 
         Girdi: retrieval sırasındaki chunk_id listesi (top-k).
         Çıktı: cache-dostu yeniden sıralanmış chunk_id listesi.
@@ -111,9 +126,28 @@ class CacheWeaverKnowledgeTree:
         değiştirmez (CacheWeaver Eq.1'deki Π(D) kısıtı — modelin gördüğü
         içerik aynı kalır, sadece prefill maliyeti değişir).
         """
-        remaining = list(retrieved_chunk_ids)  # retrieval sırası korunuyor
-        ordered: List[ChunkId] = []
+        protect_top_k = max(0, min(protect_top_k, len(retrieved_chunk_ids)))
+        protected = list(retrieved_chunk_ids[:protect_top_k])
+        rest = retrieved_chunk_ids[protect_top_k:]
+
+        if not rest:
+            return protected
+
+        # Korunan önek, ağaçta HANGİ DÜĞÜME denk geldiğini bulmak için
+        # (protected zaten sabit sırada, ama takip eden reorder'ın doğru
+        # ağaç konumundan devam etmesi için ağaçta bu öneği "yürürüz" --
+        # cache'de olsun olmasın, sadece pozisyonu buluyoruz, değiştirmiyoruz).
         node = self._root
+        for chunk_id in protected:
+            child = node.get_child(chunk_id)
+            if child is None:
+                # korunan önek ağaçta hiç yok -- kalan kısmı kökten başlat
+                node = self._root
+                break
+            node = child
+
+        remaining = list(rest)  # retrieval sırası korunuyor
+        ordered: List[ChunkId] = []
 
         while remaining:
             found_idx: Optional[int] = None
@@ -138,7 +172,7 @@ class CacheWeaverKnowledgeTree:
             ordered.append(remaining.pop(found_idx))
             node = found_child
 
-        return ordered
+        return protected + ordered
 
     def stats(self) -> dict:
         return {
@@ -185,4 +219,26 @@ if __name__ == "__main__":
     hash_key_new = build_hash_key(reordered)
     print("Eski (retrieval-sıralı) hash_key:", hash_key_old)
     print("Yeni (reorder edilmiş) hash_key :", hash_key_new)
+
+    # --- protect_top_k testleri ---------------------------------------
+    print("\n=== protect_top_k testleri ===")
+
+    # K=0: davranış AYNEN eskisi gibi olmalı (regresyon-yok garantisi)
+    reordered_k0 = tree.greedy_reorder(retrieved, protect_top_k=0)
+    assert reordered_k0 == reordered, "K=0 eski davranışı BOZMAMALI"
+    print(f"K=0 (eski davranış): {reordered_k0}  -- degismedi, OK")
+
+    # K=2: ilk 2 chunk (B, A) retrieval sırasında SABIT kalmalı, kalan
+    # {C,F,D} cache'e göre yeniden dizilmeli.
+    reordered_k2 = tree.greedy_reorder(retrieved, protect_top_k=2)
+    print(f"K=2 (ilk 2 korunuyor): {reordered_k2}")
+    assert reordered_k2[:2] == ["B", "A"], "İlk 2 chunk retrieval sırasında sabit kalmalı"
+    assert set(reordered_k2[2:]) == {"C", "F", "D"}, "Kalan chunk kümesi değişmemeli"
+    assert reordered_k2 != reordered, "K=2, K=0'dan FARKLI bir sıra üretmeli (bu örnekte)"
+
+    # K=len(retrieved): hiçbir şey yeniden sıralanmamalı, tamamen retrieval sırası
+    reordered_kall = tree.greedy_reorder(retrieved, protect_top_k=len(retrieved))
+    assert reordered_kall == retrieved, "K=tümü iken retrieval sırası hiç değişmemeli"
+    print(f"K=tümü (hiç reorder yok): {reordered_kall}  -- retrieval sırasıyla birebir aynı, OK")
+
     print("\nSelf-test PASSED.")

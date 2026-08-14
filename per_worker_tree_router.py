@@ -185,13 +185,19 @@ class PerWorkerTreeRouter:
         worker_name: str,
         retrieved_chunk_ids: Sequence[str],
         chunk_texts: Optional[Dict[str, str]] = None,
+        protect_top_k: int = 0,
     ) -> Tuple[List[str], float, int, int]:
         """Tek bir worker icin: o worker'in kendi agacina gore en iyi sira +
         TOKEN-bazli normalize cache_gain (chunk_texts verilmisse gercek
         token sayilariyla, verilmezse eski chunk-sayisi davranisiyla ayni).
-        Doner: (ordered_chunk_ids, gain, hit_tokens, total_tokens)."""
+        Doner: (ordered_chunk_ids, gain, hit_tokens, total_tokens).
+
+        protect_top_k: cacheweaver_util.greedy_reorder'a oldugu gibi
+        gecirilir -- retrieval sirasindaki ilk K chunk'i cache durumuna
+        bakmadan olmasi gereken yerde birakir (kalite-koruma, bkz.
+        cacheweaver_util.py). K=0 (varsayilan): eski davranis, degismez."""
         tree = self._trees[worker_name]
-        ordered = tree.greedy_reorder(list(retrieved_chunk_ids))
+        ordered = tree.greedy_reorder(list(retrieved_chunk_ids), protect_top_k=protect_top_k)
         token_counts = self._token_counts(retrieved_chunk_ids, chunk_texts)
         hit_tokens = self._cache_hit_tokens(tree, ordered, token_counts)
         total_tokens = sum(token_counts.get(c, 1) for c in retrieved_chunk_ids)
@@ -206,6 +212,7 @@ class PerWorkerTreeRouter:
         alpha: float = 1.0,
         beta: float = 1.0,
         chunk_texts: Optional[Dict[str, str]] = None,
+        protect_top_k: int = 0,
     ) -> PerWorkerDecision:
         """Her aday worker icin ayri best_reorder_for cagirir, skorlari
         karsilastirir, en iyisini doner.
@@ -223,7 +230,9 @@ class PerWorkerTreeRouter:
         hit_tok: Dict[str, int] = {}
         total_tok: Dict[str, int] = {}
         for name in candidate_worker_names:
-            ordered, gain, ht, tt = self.best_reorder_for(name, retrieved_chunk_ids, chunk_texts)
+            ordered, gain, ht, tt = self.best_reorder_for(
+                name, retrieved_chunk_ids, chunk_texts, protect_top_k
+            )
             orderings[name] = ordered
             gains[name] = gain
             hit_tok[name] = ht
@@ -371,5 +380,38 @@ if __name__ == "__main__":
         "hit_tokens hala chunk SAYISI gibi davraniyor (2), gercek token "
         "toplami degil"
     )
+
+    # Senaryo 5: protect_top_k -- retrieval'da EN ALAKALI (ilk) chunk cache'de
+    # DEGILKEN, saf greedy reorder onu geriye itebiliyor (cacheweaver_util.py
+    # docstring'indeki risk). protect_top_k=1 bunu engellemeli; K=0 eski
+    # (korumasiz) davranisi degistirmemeli.
+    router5 = PerWorkerTreeRouter(["w1", "w2"])
+    router5.on_request_finished("w1", ["X", "Y", "Z"])
+
+    retrieved_5 = ["Q", "X", "Y", "Z"]  # Q en alakali (retrieval sirasinda ilk) ama cache'de degil
+
+    d5_k0 = router5.choose(
+        candidate_worker_names=["w1"], retrieved_chunk_ids=retrieved_5,
+        load_norm={"w1": 0.0}, alpha=1.0, beta=1.0, protect_top_k=0,
+    )
+    d5_k1 = router5.choose(
+        candidate_worker_names=["w1"], retrieved_chunk_ids=retrieved_5,
+        load_norm={"w1": 0.0}, alpha=1.0, beta=1.0, protect_top_k=1,
+    )
+
+    print("\nSenaryo 5 (protect_top_k -- en alakali ama cache'de olmayan chunk'i koru):")
+    print(f"  K=0 (korumasiz) siralama: {d5_k0.ordered_chunk_ids}")
+    print(f"  K=1 (Q korunuyor)  siralama: {d5_k1.ordered_chunk_ids}")
+    assert d5_k0.ordered_chunk_ids[0] != "Q", (
+        "K=0'da Q'nun one gecmemesi beklenirdi (saf greedy reorder onu geriye "
+        "itiyor olmali) -- senaryo degisti, kontrol et"
+    )
+    assert d5_k1.ordered_chunk_ids[0] == "Q", (
+        "K=1 iken Q ILK SIRADA kalmali -- protect_top_k dogru calismiyor olabilir"
+    )
+    assert set(d5_k1.ordered_chunk_ids) == set(retrieved_5), (
+        "protect_top_k KUMEYI degistirmemeli, sadece sirayi"
+    )
+    print("  OK -- K=0'da Q geriye itiliyor, K=1'de korunuyor")
 
     print("\nSelf-test PASSED.")
