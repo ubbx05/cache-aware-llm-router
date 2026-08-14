@@ -407,14 +407,30 @@ class PerWorkerTreeStrategy(Strategy):
       uygulanmasi main.py'nin decision.ordered_chunk_ids'i okuyup prompt'u
       yeniden yazmasina bagli (bkz. main.py _handle_completion, CHUNK_SEP).
 
-    Overlap-adaptive alpha/beta (config.OVERLAP_ADAPTIVE_ENABLED, varsayilan
-    KAPALI): acikken, her decide_order() cagrisinda bu isteğin chunk_ids'i
-    ile BIR ONCEKI cagrinin chunk_ids'i arasindaki Jaccard hesaplanir (bkz.
-    adaptive_weights() yukarida, jaccard() bench/overlap_measurement.py'den
-    import edildi -- yeniden yazilmadi) ve config.ALPHA/BETA yerine bu
-    ölçüme gore secilen alpha/beta kullanilir. KAPALIYKEN davranis eskisiyle
-    BIREBIR ayni -- config.ALPHA/BETA sabitleri degismeden kullanilir, ne
-    self._prev_chunk_ids okunur ne de jaccard() cagrilir.
+    Overlap-adaptive alpha/beta (config.OVERLAP_ADAPTIVE_MODE, varsayilan
+    "off"): her decide_order() cagrisinda bu isteğin chunk_ids'i ile BIR
+    ONCEKI cagrinin chunk_ids'i arasindaki Jaccard hesaplanir (bkz. jaccard()
+    bench/overlap_measurement.py'den import edildi -- yeniden yazilmadi).
+    IKI ayri mod bu tek sinyali farkli kullanir -- deliberate: modu
+    degistirmek SADECE adaptasyon mekanizmasini degistirsin, girdi sinyalini
+    degil (kontrollu ablation):
+
+    - "threshold": adaptive_weights() (yukarida) -- basit esik-switch,
+      overlap < OVERLAP_THRESHOLD ise LOW_OVERLAP_ALPHA, degilse
+      HIGH_OVERLAP_ALPHA (beta = 1-alpha).
+    - "ewma_cusum": adaptive_drift_model.py'nin OnlineDriftEstimator +
+      CusumDriftDetector'i (adaptive_cache_aware ile AYNI mekanizma, ama
+      AYRI bir instance -- bu stratejinin kendi hafizasi, D_TARGET/DRIFT_LAM/
+      CUSUM_K/CUSUM_H config degerleri paylasiliyor, state paylasilmiyor).
+      adaptive_cache_aware'den farki: burada girdi SESSION-adjacent degil,
+      threshold moduyla AYNI ardisik-cift (global) Jaccard -- karsilastirma
+      kontrollu kalsin diye. Sadece BETA canli ayarlanir (adaptive_beta),
+      ALPHA sabit config.ALPHA kalir -- adaptive_drift_model.py'nin kendi
+      tasarim varsayimiyla ayni (bkz. AdaptiveCacheAware).
+
+    "off" iken davranis eskisiyle BIREBIR ayni -- config.ALPHA/BETA
+    sabitleri degismeden kullanilir, ne self._prev_chunk_ids okunur ne
+    jaccard() ya da drift tahmincileri cagrilir.
     """
 
     name = "per_worker_tree"
@@ -423,7 +439,13 @@ class PerWorkerTreeStrategy(Strategy):
         super().__init__(tracker)
         self._names = [w.name for w in config.WORKERS if w.enabled]
         self._router = PerWorkerTreeRouter(worker_names=self._names)
-        self._prev_chunk_ids: set[str] | None = None  # sadece OVERLAP_ADAPTIVE_ENABLED iken kullanilir
+        self._prev_chunk_ids: set[str] | None = None  # sadece MODE != "off" iken kullanilir
+        # Sadece "ewma_cusum" modunda kullanilir -- her strateji ORNEGININ
+        # kendi hafizasi, adaptive_cache_aware'inkiyle PAYLASILMAZ.
+        self._drift_estimator = OnlineDriftEstimator(lam=config.DRIFT_LAM)
+        self._drift_detector = CusumDriftDetector(
+            d_ref=config.D_TARGET, k=config.CUSUM_K, h=config.CUSUM_H
+        )
 
     def decide_order(self, chunk_ids: list[str], snap: Snapshot) -> PerWorkerDecision:
         """Ham (siralanmamis, retrieval sirasindaki) chunk_ids alir, worker +
@@ -435,7 +457,10 @@ class PerWorkerTreeStrategy(Strategy):
         if not healthy_names:
             raise NoHealthyWorker()
 
-        if config.OVERLAP_ADAPTIVE_ENABLED:
+        mode = config.OVERLAP_ADAPTIVE_MODE
+        if mode == "off":
+            alpha, beta = config.ALPHA, config.BETA
+        elif mode == "threshold":
             from bench.overlap_measurement import jaccard
 
             overlap = jaccard(self._prev_chunk_ids or set(), set(chunk_ids))
@@ -444,8 +469,20 @@ class PerWorkerTreeStrategy(Strategy):
                 config.LOW_OVERLAP_ALPHA, config.HIGH_OVERLAP_ALPHA,
             )
             self._prev_chunk_ids = set(chunk_ids)
+        elif mode == "ewma_cusum":
+            from bench.overlap_measurement import jaccard
+
+            overlap = jaccard(self._prev_chunk_ids or set(), set(chunk_ids))
+            d_t = self._drift_estimator.update(overlap)
+            self._drift_detector.update(overlap, current_ewma_estimate=d_t)
+            alpha = config.ALPHA
+            beta = adaptive_beta(config.BETA, d_t, config.D_TARGET)
+            self._prev_chunk_ids = set(chunk_ids)
         else:
-            alpha, beta = config.ALPHA, config.BETA
+            raise ValueError(
+                f"unknown ROUTER_OVERLAP_ADAPTIVE_MODE {mode!r}; "
+                f"expected 'off', 'threshold', or 'ewma_cusum'"
+            )
 
         loads = self._normalised_loads(snap)
         decision = self._router.choose(
@@ -454,6 +491,7 @@ class PerWorkerTreeStrategy(Strategy):
             load_norm=loads,
             alpha=alpha,
             beta=beta,
+            protect_top_k=config.PROTECT_TOP_K,
         )
         self._router.on_request_finished(decision.worker_name, decision.ordered_chunk_ids)
         return decision
@@ -540,6 +578,7 @@ class SemanticPerWorkerTreeStrategy(Strategy):
             load_norm=loads,
             alpha=config.ALPHA,
             beta=config.BETA,
+            protect_top_k=config.PROTECT_TOP_K,
         )
         self._per_worker_router.on_request_finished(decision.worker_name, decision.ordered_chunk_ids)
         if query_text:

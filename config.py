@@ -108,13 +108,18 @@ LOAD_W_PENDING: float = _env_float("ROUTER_LOAD_W_PENDING", 1.0)
 LOAD_REF: float = _env_float("ROUTER_LOAD_REF", 16.0)
 
 # --- Overlap-adaptive alpha/beta (per_worker_tree only) --------------------
-# Simple threshold switch, NOT an EWMA/CUSUM estimator (that mechanism was
-# scoped OUT of this task deliberately -- see adaptive_drift_model.py for the
-# more elaborate version, which this does not replace or depend on). Off by
-# default so every existing strategy comparison stays byte-for-byte
-# reproducible; flip it on to compare "Per-Worker Joint" against "Per-Worker
-# Joint + Adaptive" in the ablation table.
-OVERLAP_ADAPTIVE_ENABLED: bool = _env_bool("ROUTER_OVERLAP_ADAPTIVE", False)
+# Two independent adaptation mechanisms, selected by mode, both driven by the
+# same consecutive-pair Jaccard signal (bkz. strategies.PerWorkerTreeStrategy
+# docstring -- deliberately controlled so switching modes only changes the
+# adaptation mechanism, not the input). "off" by default so every existing
+# strategy comparison stays byte-for-byte reproducible.
+#   off        : config.ALPHA/BETA fixed (old behaviour, unchanged)
+#   threshold  : simple threshold switch (strategies.adaptive_weights)
+#   ewma_cusum : adaptive_drift_model.py's EWMA+CUSUM (adaptive_beta),
+#                same mechanism as adaptive_cache_aware but a separate
+#                instance/state, reusing the D_TARGET/DRIFT_LAM/CUSUM_K/
+#                CUSUM_H values defined below
+OVERLAP_ADAPTIVE_MODE: str = os.getenv("ROUTER_OVERLAP_ADAPTIVE_MODE", "off")
 
 # Consecutive-request Jaccard overlap (bench/overlap_measurement.py's
 # definition, |A∩B|/|A∪B|) below this counts as "low overlap": the previous
@@ -127,6 +132,16 @@ OVERLAP_THRESHOLD: float = _env_float("ROUTER_OVERLAP_THRESHOLD", 0.3)
 # parameter per regime, not two, by design (bkz. strategies.adaptive_weights).
 LOW_OVERLAP_ALPHA: float = _env_float("ROUTER_LOW_OVERLAP_ALPHA", 0.2)
 HIGH_OVERLAP_ALPHA: float = _env_float("ROUTER_HIGH_OVERLAP_ALPHA", 0.8)
+
+# --- Quality-protection for reordering (per_worker_tree family only) ------
+# cacheweaver_util.py's greedy_reorder() can push a highly-relevant-but-
+# uncached chunk to the end of the prompt and pull a barely-relevant-but-
+# cached one to the front. CacheWeaver's own paper (Table 7) does not fully
+# rule out this hurting answer quality. protect_top_k pins the first K
+# retrieval-order chunks in place -- untouched by cache state -- and only
+# reorders what comes after. 0 (default): unchanged behaviour, no chunks
+# protected.
+PROTECT_TOP_K: int = _env_int("ROUTER_PROTECT_TOP_K", 0)
 
 # --- Semantic pre-filter (semantic_per_worker_tree only) -------------------
 # How many workers the semantic candidate predictor hands to
