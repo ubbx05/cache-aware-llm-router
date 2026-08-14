@@ -46,11 +46,30 @@ aşağıda placeholder bir hesap var, TODO ile işaretlendi.
 from __future__ import annotations
 
 import hashlib
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from cacheweaver_util import CacheWeaverKnowledgeTree, build_hash_key
+
+
+def _break_tie(a: int, b: int, val_a: float, val_b: float) -> Tuple[int, int]:
+    """(winner, loser) by lower val; ties broken uniformly at random.
+
+    DUZELTME: bu fonksiyon olmadan _slo_aware_select iki karsilastirmasi da
+    `<=` kullaniyordu, yani val_a==val_b HER ZAMAN a'yi (r1'i) kazandiriyordu
+    -- r1/r2 atamasi hash_key'e gore sabit oldugu icin bu, ayni chunk
+    kombinasyonunu tekrar tekrar goren istekleri hep AYNI replica'ya
+    yigiyordu (bkz. worker-split asimetrisi bulgusu, gun-raporu 2026-08-13
+    Bolum 6). strategies.py::_argmax ve per_worker_tree_router.py::choose()
+    ayni sebeple zaten random.choice kullaniyor -- bu, o disiplinin burada da
+    uygulanmasi."""
+    if val_a < val_b:
+        return a, b
+    if val_b < val_a:
+        return b, a
+    return (a, b) if random.random() < 0.5 else (b, a)
 
 
 # ======================================================================
@@ -203,21 +222,17 @@ class CacheWeaverDualMapRouter:
         recompute_r2 = rep2.estimate_recompute_tokens(ordered_chunk_ids, cache_hit_len_r2)
 
         # Cache-affinity: daha yüksek cache-hit'e sahip (= daha az recompute
-        # gereken) adayı önce tercih et.
-        if recompute_r1 <= recompute_r2:
-            cache_pref_primary, cache_pref_second = r1, r2
-        else:
-            cache_pref_primary, cache_pref_second = r2, r1
+        # gereken) adayı önce tercih et. Eşitlikte rastgele kırılır (bkz.
+        # _break_tie docstring'i) -- r1'i sessizce kayırmak yerine.
+        cache_pref_primary, cache_pref_second = _break_tie(r1, r2, recompute_r1, recompute_r2)
 
         if rep1.is_overloaded(self._ttft_slo_threshold_tokens) if cache_pref_primary == r1 \
                 else rep2.is_overloaded(self._ttft_slo_threshold_tokens):
             # DualMap §3.2: cache-affine aday overloaded ise min-TTFT'e geç
             ttft_r1 = rep1.estimate_ttft(recompute_r1)
             ttft_r2 = rep2.estimate_ttft(recompute_r2)
-            if ttft_r1 <= ttft_r2:
-                return r1, r2, False
-            else:
-                return r2, r1, False
+            winner, loser = _break_tie(r1, r2, ttft_r1, ttft_r2)
+            return winner, loser, False
 
         return cache_pref_primary, cache_pref_second, True
 
@@ -321,3 +336,30 @@ if __name__ == "__main__":
     print("req-3 (yüklü instance sonrası) ->", d3, "cache_affinity_used=", d3.used_cache_affinity)
 
     print("\nDemo PASSED (hata fırlatmadan tamamlandı).")
+
+    # ------------------------------------------------------------------
+    # Tie-break adalet testi: eskiden `<=` kullanildigi icin recompute_r1==
+    # recompute_r2 oldugunda HER ZAMAN r1 kazaniyordu (gun-raporu 2026-08-13
+    # Bolum 6'daki sabit worker-split asimetrisinin en olasi nedeni). Bircok
+    # BAGIMSIZ hash_key ile (her biri kendi r1/r2 atamasina sahip, ikisi de
+    # BOS agacla basliyor -- yani recompute_r1=recompute_r2=0, garantili
+    # esitlik) primary_replica dagilimi kabaca %50/%50 olmali.
+    print("\n== Tie-break adalet testi (esitlikte r1'i sessizce kayirma) ==")
+    fair_router = CacheWeaverDualMapRouter(num_replicas=2)
+    primary_counts = {0: 0, 1: 0}
+    n_trials = 400
+    for i in range(n_trials):
+        # Her deneme FARKLI (ve o ana kadar hic gorulmemis) bir chunk kombinasyonu
+        # kullaniyor ki iki agac da her seferinde bos/esit kalsin (recompute=0=0).
+        d = fair_router.route_request(f"fair-{i}", [f"chunk-{i}-{j}" for j in range(3)])
+        primary_counts[d.primary_replica] += 1
+    print(f"  primary_replica dagilimi ({n_trials} deneme, hepsi esitlik): {primary_counts}")
+    minority = min(primary_counts.values())
+    assert minority > n_trials * 0.35, (
+        f"dagilim hala carpik ({primary_counts}) -- eskiden HER ZAMAN {{0: {n_trials}, 1: 0}} "
+        f"cikardi (r1'i sessizce kayirma bug'i); duzeltme sonrasi ~%50/%50 beklenir"
+    )
+    print(f"  OK -- ~%50/%50'ye yakin (azinlik: {minority}/{n_trials} = {minority/n_trials:.1%}), "
+          f"eski davranis HER ZAMAN {{0: {n_trials}, 1: 0}} verirdi")
+
+    print("\nTie-break adalet testi PASSED.")
