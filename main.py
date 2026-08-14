@@ -90,6 +90,17 @@ async def _startup() -> None:
     tracker = PrefixTracker(names)
     strategy = build_strategy(config.STRATEGY, tracker)
 
+    # Optional capability, same hasattr convention as decide_order's check in
+    # /router/decide_order below. Only semantic_per_worker_tree defines this
+    # today -- forces SentenceTransformer's lazy load (~5-6s one-time,
+    # measured gun-raporu 2026-08-13) to happen now, blocking startup, rather
+    # than silently landing on whichever live request arrives first.
+    if hasattr(strategy, "warmup"):
+        log.info("warming up %s ...", strategy.name)
+        t0 = time.perf_counter()
+        strategy.warmup()
+        log.info("warmup done in %.1fs", time.perf_counter() - t0)
+
     state.update(
         client=client,
         poll_client=poll_client,

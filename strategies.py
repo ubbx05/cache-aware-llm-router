@@ -511,6 +511,12 @@ class SemanticPerWorkerTreeStrategy(Strategy):
             worker_names=self._names, embed_fn=real_embed, lr=config.SEMANTIC_CENTROID_LR,
         )
 
+    def warmup(self) -> None:
+        """main.py's startup checks for this (hasattr, same convention as
+        decide_order's optional-capability check) so the SentenceTransformer
+        load lands here, once, rather than on the first live request."""
+        self._semantic_router.warmup()
+
     def decide_order(self, chunk_ids: list[str], snap: Snapshot,
                      query_text: str | None = None) -> PerWorkerDecision:
         healthy_names = [s.name for s in snap.healthy() if s.name in self._names]

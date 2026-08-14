@@ -240,6 +240,16 @@ class SemanticWorkerRouter:
         query_vec = self._embed_fn(query_text)
         self._tracker.update(worker_name, query_vec)
 
+    def warmup(self) -> None:
+        """embed_fn'in ilk cagrisini simdi, senkron olarak zorlar -- ilk
+        GERCEK istekte degil. real_embed() icin bu, SentenceTransformer'in
+        lazy-load'u (~5-6s tek seferlik, gun-raporu 2026-08-13'te olculdu)
+        demek; bunsuz bu maliyet router baslarken degil, hangi canli istek
+        ilk gelirse ona biniyordu (rapordaki acik is maddesi). Sonuc
+        atiliyor -- tek amac embed modelinin belleğe yuklu olmasini
+        garantilemek, centroid'lere hicbir sey yazilmiyor."""
+        self._embed_fn("warmup")
+
 
 # ======================================================================
 # Kendi-kendini-test: iki "konu kumesi" simule edip, sistemin doÄru
