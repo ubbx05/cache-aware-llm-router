@@ -1,9 +1,11 @@
 """3x3 deney matrisi: overlap (dusuk/orta/yuksek) x yuk (dusuk/orta/yuksek).
 
-KATKI_OZETI.md Bolum 7b'deki 3x3 tabloyu doldurmak icin. Her hucrede 5
-strateji kosuluyor: round_robin, least_loaded, cacheweaver_dualmap,
-per_worker_tree (adaptive=False), per_worker_tree (adaptive=True) -- 5x9=45
-kosum.
+KATKI_OZETI.md Bolum 7b'deki 3x3 tabloyu doldurmak icin. Her hucrede TUM
+STRATEGY_CONFIGS kosuluyor (varsayilan 7 strateji: round_robin,
+least_loaded, cacheweaver_dualmap, per_worker_tree'nin uc overlap-adaptive
+modu -- off/threshold/ewma_cusum, bkz. config.OVERLAP_ADAPTIVE_MODE -- ve
+semantic_per_worker_tree) -- 7x9=63 kosum, coksa --strategies ile
+filtrelenebilir (ornek: --strategies round_robin,per_worker_tree).
 
 Neden overlap ekseni icin zipf-s (gen_trace.py'nin var olan parametresi)
 kullanildi, yeni bir "session karisma" parametresi eklenmedi: zaten olculdu
@@ -19,19 +21,23 @@ ayni istek sayisini daha kisa surede/dahayogun gonderiyor -- ekstra kod
 gerektirmeyen, var olan bir yuk kolu.
 
 Router her strateji icin AYRI bir surec olarak baslatiliyor (uvicorn
-main:app), cunku config.STRATEGY/config.OVERLAP_ADAPTIVE_ENABLED main.py
+main:app), cunku config.STRATEGY/config.OVERLAP_ADAPTIVE_MODE main.py
 baslarken BIR KERE okunuyor (bkz. main.py _startup, strategies.build_strategy
 cagrisi) -- calisirken degistirilemez. Bu yuzden strateji basina restart
 sarti var, sweep_batch.py'nin tek-worker konsantrasyon taramasindan farkli
 olarak (o script router'a hic dokunmuyor, dogrudan vLLM'e gidiyor).
 
 BU SCRIPT'I CALISTIRMAK GPU/vLLM GEREKTIRIR. --dry-run ile (GPU'suz) sadece
-45 hucrelik plani yazdirip hicbir subprocess baslatmadan dogrulayabilirsin --
-syntax/import/orkestrasyon mantigini kontrol etmek icin yeterli.
+secili hucrelerin planini yazdirip hicbir subprocess baslatmadan
+dogrulayabilirsin -- syntax/import/orkestrasyon mantigini kontrol etmek icin
+yeterli.
 
 Usage:
-    # plan/orkestrasyon mantigini GPU olmadan dogrula
+    # plan/orkestrasyon mantigini GPU olmadan dogrula (tum 63 hucre)
     python sweep_overlap_load.py --dry-run
+
+    # sadece bazi stratejileri dogrula/kos (kademeli calistirma icin)
+    python sweep_overlap_load.py --dry-run --strategies round_robin,per_worker_tree
 
     # gercek kosum (GPU + calisan vLLM worker'lari gerektirir)
     python sweep_overlap_load.py --corpus ./corpus \
@@ -81,18 +87,39 @@ class StrategyConfig:
     order: str                     # replay.py --order (canonical | per_worker_tree)
 
 
+# 7 strateji: 3 cache-blind/tek-mekanizma baseline + per_worker_tree'nin 3
+# overlap-adaptive modu (off/threshold/ewma_cusum -- bkz.
+# strategies.PerWorkerTreeStrategy, config.OVERLAP_ADAPTIVE_MODE) +
+# semantic_per_worker_tree. semantic_per_worker_tree de decide_order()
+# uyguladigi icin (per_worker_tree ile ayni iki-asamali akis) order=
+# "per_worker_tree" kullaniyor -- ancak main.py'nin /router/decide_order
+# endpoint'i su an query_text tasimiyor (bkz. strategies.py'deki
+# SemanticPerWorkerTreeStrategy docstring'i, "SINIRLAMA"), yani bu koşuda
+# semantik on-filtre sessizce devre disi kalir, duz per_worker_tree gibi
+# davranir -- yine de gecerli bir baseline noktasi (per_worker_tree'nin
+# hicbir semantik/adaptif katmani olmayan hali).
 STRATEGY_CONFIGS: list[StrategyConfig] = [
     StrategyConfig("round_robin", {"ROUTER_STRATEGY": "round_robin"}, "canonical"),
     StrategyConfig("least_loaded", {"ROUTER_STRATEGY": "least_loaded"}, "canonical"),
     StrategyConfig("cacheweaver_dualmap", {"ROUTER_STRATEGY": "cacheweaver_dualmap"}, "canonical"),
     StrategyConfig(
         "per_worker_tree",
-        {"ROUTER_STRATEGY": "per_worker_tree", "ROUTER_OVERLAP_ADAPTIVE": "false"},
+        {"ROUTER_STRATEGY": "per_worker_tree", "ROUTER_OVERLAP_ADAPTIVE_MODE": "off"},
         "per_worker_tree",
     ),
     StrategyConfig(
-        "per_worker_tree+adaptive",
-        {"ROUTER_STRATEGY": "per_worker_tree", "ROUTER_OVERLAP_ADAPTIVE": "true"},
+        "per_worker_tree+threshold",
+        {"ROUTER_STRATEGY": "per_worker_tree", "ROUTER_OVERLAP_ADAPTIVE_MODE": "threshold"},
+        "per_worker_tree",
+    ),
+    StrategyConfig(
+        "per_worker_tree+ewma_cusum",
+        {"ROUTER_STRATEGY": "per_worker_tree", "ROUTER_OVERLAP_ADAPTIVE_MODE": "ewma_cusum"},
+        "per_worker_tree",
+    ),
+    StrategyConfig(
+        "semantic_per_worker_tree",
+        {"ROUTER_STRATEGY": "semantic_per_worker_tree"},
         "per_worker_tree",
     ),
 ]
@@ -258,20 +285,40 @@ def score_results(results_path: Path) -> CellResult:
     return res
 
 
-def build_plan(args) -> list[tuple[str, float, str, float, StrategyConfig]]:
-    """(overlap_label, zipf_s, load_label, speedup, strategy_config) -- 45
-    hucrenin tam listesi. --dry-run bu fonksiyonu cagirip subprocess hic
-    baslatmadan yazdirir."""
+def select_strategies(args) -> list[StrategyConfig]:
+    """--strategies verilmemisse (varsayilan) TUMU -- 7 strateji x 9 hucre =
+    63 kosu, cok sayida. --strategies round_robin,per_worker_tree gibi
+    virgulle ayrilmis bir liste ile kademeli calistirilabilir."""
+    if not args.strategies:
+        return list(STRATEGY_CONFIGS)
+    wanted = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    by_label = {sc.label: sc for sc in STRATEGY_CONFIGS}
+    unknown = [w for w in wanted if w not in by_label]
+    if unknown:
+        raise SystemExit(
+            f"bilinmeyen strateji(ler): {unknown} -- gecerli etiketler: "
+            f"{sorted(by_label)}"
+        )
+    return [by_label[w] for w in wanted]
+
+
+def build_plan(
+    args, strategies: list[StrategyConfig]
+) -> list[tuple[str, float, str, float, StrategyConfig]]:
+    """(overlap_label, zipf_s, load_label, speedup, strategy_config) -- tum
+    hucrelerin listesi (--strategies ile filtrelenmis olabilir). --dry-run
+    bu fonksiyonu cagirip subprocess hic baslatmadan yazdirir."""
     plan = []
     for overlap_label, zipf_s in OVERLAP_LEVELS:
         for load_label, speedup in LOAD_LEVELS:
-            for sc in STRATEGY_CONFIGS:
+            for sc in strategies:
                 plan.append((overlap_label, zipf_s, load_label, speedup, sc))
     return plan
 
 
 def run(args) -> None:
-    plan = build_plan(args)
+    strategies = select_strategies(args)
+    plan = build_plan(args, strategies)
 
     if args.dry_run:
         print(f"{'overlap':>8} {'zipf_s':>7} {'load':>6} {'speedup':>8}  strategy")
@@ -296,7 +343,7 @@ def run(args) -> None:
     results: list[CellResult] = []
     port = args.port
     for overlap_label, zipf_s in OVERLAP_LEVELS:
-        for sc in STRATEGY_CONFIGS:
+        for sc in strategies:
             print(f"\n== router baslatiliyor: strategy={sc.label} port={port} ==")
             proc = start_router(args, sc.env, port)
             try:
@@ -359,8 +406,13 @@ def main() -> None:
     p.add_argument("--work-dir", default="./sweep_overlap_load_work",
                    help="ara trace/results dosyalarinin yazilacagi klasor")
     p.add_argument("--out", default="sweep_results.csv")
+    p.add_argument("--strategies", default=None,
+                   help="virgulle ayrilmis strateji etiketi listesi (bkz. STRATEGY_CONFIGS); "
+                        f"varsayilan: TUMU ({len(STRATEGY_CONFIGS)} strateji x 9 hucre = "
+                        f"{len(STRATEGY_CONFIGS) * 9} kosu -- coksa kademeli calistirmak icin "
+                        "bu flag'i kullan, ornek: --strategies round_robin,per_worker_tree")
     p.add_argument("--dry-run", action="store_true",
-                   help="hicbir subprocess baslatma -- sadece 45 hucrelik plani yazdir "
+                   help="hicbir subprocess baslatma -- sadece secili hucrelerin planini yazdir "
                         "(GPU/vLLM gerektirmeyen dogrulama)")
     args = p.parse_args()
     run(args)
