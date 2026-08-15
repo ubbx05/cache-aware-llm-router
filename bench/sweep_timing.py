@@ -221,9 +221,17 @@ def main() -> None:
     report(ordered, args.repeats)
 
     summary_path = Path(args.outdir) / "timing_sweep.json"
+    # The run's configuration travels with its numbers. Comparing two sweeps
+    # at different --speedup (which is exactly how the load axis gets built)
+    # otherwise means trusting a directory name to remember what was varied.
+    config = {k: getattr(args, k) for k in
+              ("repeats", "speedup", "top_k", "limit", "strategy", "order",
+               "tokenizer", "tracker_capacity", "trace", "corpus")
+              if hasattr(args, k)}
     summary_path.write_text(json.dumps(
-        {s.arm: [r.__dict__ | {"out_path": str(r.out_path)} for r in s.runs]
-         for s in ordered}, indent=2), encoding="utf-8")
+        {"config": config,
+         "arms": {s.arm: [r.__dict__ | {"out_path": str(r.out_path)} for r in s.runs]
+                  for s in ordered}}, indent=2), encoding="utf-8")
     print(f"\nraw: {summary_path}")
 
 
