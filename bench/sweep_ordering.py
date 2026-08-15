@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import json
 import statistics
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,7 +47,7 @@ sys.path.insert(0, str(BENCH_DIR))
 # reader already exist and are already the ones every other sweep uses. A
 # second copy would be a second thing to keep in sync.
 from sweep_overlap_load import (  # noqa: E402
-    run_replay,
+    run_replay as _run_replay,
     score_results,
     start_router,
     stop_router,
@@ -56,6 +57,25 @@ from score_quality import evaluate  # noqa: E402
 
 ROUTER_PORT = 8099  # deliberately not 8080, so a router you left running by
                     # hand cannot silently serve these runs instead
+
+
+def run_replay(*a, **kw) -> None:
+    """sweep_overlap_load.run_replay, but it does not eat the child's output.
+
+    That function captures stdout+stderr into a pipe and passes check=True, so
+    a failing replay surfaces as a bare CalledProcessError with the actual
+    reason -- a missing corpus, an unreachable router, a bad flag -- discarded.
+    Over a 9-run sequence with a human waiting at each step, that is the
+    difference between a one-line fix and re-running blind.
+    """
+    try:
+        _run_replay(*a, **kw)
+    except subprocess.CalledProcessError as exc:
+        out = exc.output.decode("utf-8", "replace") if exc.output else "(no output)"
+        print("\n--- replay.py failed, its output follows ---")
+        print(out.strip()[-4000:])
+        print("--- end replay.py output ---\n")
+        raise
 
 
 @dataclass
@@ -199,7 +219,19 @@ def main() -> None:
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     if not arms:
         raise SystemExit("--arms is empty")
-    Path(args.outdir).mkdir(parents=True, exist_ok=True)
+
+    # Absolute, because replay.py is launched with cwd=BENCH_DIR (that is
+    # sweep_overlap_load's convention and every other sweep depends on it).
+    # A relative --corpus/--trace typed at the repo root would be resolved
+    # against bench/ instead and fail there, with the real error buried in a
+    # captured pipe. Resolving here makes the caller's cwd irrelevant.
+    for attr in ("corpus", "trace"):
+        path = Path(getattr(args, attr)).expanduser().resolve()
+        if not path.exists():
+            raise SystemExit(f"--{attr}: not found: {path}")
+        setattr(args, attr, str(path))
+    args.outdir = Path(args.outdir).expanduser().resolve()
+    args.outdir.mkdir(parents=True, exist_ok=True)
 
     if not args.tracker_capacity:
         print("WARNING: --tracker-capacity not set, router will use the 50000")
