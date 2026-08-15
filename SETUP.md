@@ -1,48 +1,79 @@
 # Başka bir makinede kurulum
 
-`git clone` sana **sadece kodu** verir. Deneyi çalıştırmak için gereken her
-şeyin geri kalanı — korpus, embedding'ler, trace'ler, TQuAD kaynak dosyası —
-`.gitignore`'da (`corpus/`, `*.jsonl`, `*.json`, `embeddings.npy`). Yani temiz
-bir clone'da `replay.py` ilk satırda ölür. Bu dosya aradaki farkı kapatıyor.
+`git clone` sana **sadece kodu** verir — korpus, embedding'ler ve trace'ler
+`.gitignore`'da (`corpus/`, `*.jsonl`, `*.json`, `embeddings.npy`), yani repoyla
+birlikte gelmezler. Karşı makinede bu dosyalar zaten mevcut olduğu için asıl iş
+onları taşımak değil, **doğru olduklarını doğrulamak** (1. bölüm).
 
-En kritik madde 3. bölümde: **kalibrasyon sabitleri bu donanıma ait**. Paper'ın
-kendi bulgusu (Bölüm VI-B), yanlış kalibre edilmiş bir sabitin bir ablation'ın
-sonucunu *ters çevirdiği*. Yeni makinede o sabitleri taşımak, sessizce yanlış
-bir sonuç üretmenin en kolay yolu.
+Genel ilke: bu kurulumda sessizce yanlış olabilecek iki şey var, ikisi de hata
+vermeden makul görünen sayılar üretir.
+
+- **Yanlış veri** (1. bölüm): farklı bir korpus/trace, sorunsuz koşar ama
+  buradaki ölçümlerle karşılaştırılamaz.
+- **Yanlış kalibrasyon** (3. bölüm): sabitler bu donanıma ait. Paper'ın kendi
+  bulgusu (Bölüm VI-B), yanlış kalibre edilmiş tek bir sabitin bir ablation'ın
+  sonucunu *ters çevirdiği*.
+
+Eksik dosya ya da yanlış IP kendini hemen belli eder; bu ikisi etmez. O yüzden
+1. ve 3. bölümler diğerlerinden önce gelir.
 
 ---
 
-## 1. Veri dosyaları — kopyala, yeniden üretme
+## 1. Veri dosyaları — kopyalama değil, DOĞRULAMA problemi
 
-Şu an bu dosyalar `/home/os/bil401/old/cache-aware-llm-router/` altında:
+Karşı makinede korpus ve trace'ler **zaten var**. O yüzden buradaki risk
+"dosya eksik" değil (o kendini hemen belli eder, `replay.py` açılışta ölür).
+Risk, oradaki dosyaların **başka bir veri seti** olması: farklı bir korpus ya
+da farklı parametrelerle üretilmiş bir trace, hiçbir hata vermeden koşar,
+makul görünen sayılar üretir ve o sayılar buradaki koşularla
+karşılaştırılamaz. Sessizce yanlış olan tek şey bu.
 
-| Dosya | Boyut | Ne işe yarıyor |
-|---|---|---|
-| `corpus/corpus.jsonl` | 3.5 MB | 2619 chunk, BLOCK_SIZE'a padlenmiş |
-| `corpus/embeddings.npy` | 8.0 MB | chunk embedding'leri (multilingual-e5-base, L2-normalize) |
-| `corpus/embed_meta.json` | 161 B | hangi modelle üretildiği |
-| `corpus/qa.jsonl` | 1.8 MB | soru + gold answer + ground-truth chunk |
-| `trace.jsonl` | 812 KB | 3000 istek, zipf_s=1.0, seed=401 |
-| `trace_hot.jsonl` | 804 KB | zipf_s=1.5, session-len=4 |
-| `train-v0.1.json` | 3.0 MB | TQuAD kaynağı (sadece korpusu yeniden üretmek için) |
+Bu makinedeki kanonik veri setinin parmak izi (2026-08-15'te ölçüldü;
+`~/bil401/old/cache-aware-llm-router/` ile `~/Downloads/` kopyaları
+byte-byte aynı):
 
-Toplam ~18 MB. Yeni makineye:
-
-```bash
-rsync -av /home/os/bil401/old/cache-aware-llm-router/corpus \
-          /home/os/bil401/old/cache-aware-llm-router/trace.jsonl \
-          /home/os/bil401/old/cache-aware-llm-router/trace_hot.jsonl \
-          yeni-pc:~/bil401/data/
+```
+92fba696def911504a1286e2e3c96e9d  corpus/corpus.jsonl
+a0d29eb13fbd72060a3338b2434de039  corpus/embeddings.npy
+a7a395db102006c6132de5f886fe04ea  corpus/qa.jsonl
+a5874ffece10fcf3aa44eea2d4308679  trace.jsonl
+abbe8dec6fa2267e0f919eae0f5f2414  trace_hot.jsonl
 ```
 
-**Neden yeniden üretmek yerine kopyalıyoruz:** `build_corpus.py` deterministik
-görünüyor ama embedding'ler CPU'da float32 üretiliyor ve farklı BLAS/donanımda
-son bit'leri oynayabiliyor. Retrieval top-k'sı eşiğe yakın chunk'larda buna
-duyarlı — yani yeniden üretilmiş bir korpus, eski koşularınla **karşılaştırılabilir
-olmayan** bir top-k üretebilir. Sıfırdan üretmek ayrıca ~1 saat CPU
-(2619 chunk × forward pass).
+Karşı makinede, veri neredeyse:
 
-Gerçekten sıfırdan gerekiyorsa (ör. korpusu büyütmek):
+```bash
+cd <oradaki-veri-dizini>
+md5sum corpus/corpus.jsonl corpus/embeddings.npy corpus/qa.jsonl \
+       trace.jsonl trace_hot.jsonl
+```
+
+**Hepsi tutuyorsa:** aynı veri setindesiniz, buradaki tüm ölçümlerle
+(paper'ın 0.476 session-adjacent'i, `D_TARGET=0.529`, top-k A/B'leri)
+doğrudan karşılaştırılabilir. Devam et.
+
+**`trace*.jsonl` tutmuyor ama `corpus/` tutuyorsa:** başka parametrelerle
+üretilmiş bir trace var demektir. Ölümcül değil ama `ROUTER_D_TARGET`
+o trace için yeniden ölçülmeli (bkz. 3. bölüm) ve sonuçlar buradaki
+koşuların devamı olarak değil, ayrı bir seri olarak raporlanmalı.
+
+**`corpus/` tutmuyorsa:** dur. Farklı korpus = farklı chunk id'leri = farklı
+retrieval = hiçbir şey karşılaştırılabilir değil. Bu durumda buradaki
+kanonik kopyayı gönder (~13 MB) ve oradakinin üstüne yaz:
+
+```bash
+rsync -av ~/bil401/old/cache-aware-llm-router/corpus \
+          ~/bil401/old/cache-aware-llm-router/trace.jsonl \
+          ~/bil401/old/cache-aware-llm-router/trace_hot.jsonl \
+          karsi-pc:<hedef-dizin>/
+```
+
+**Korpusu orada yeniden ÜRETME.** `build_corpus.py` deterministik görünüyor
+ama embedding'ler CPU'da float32 üretiliyor ve farklı BLAS/donanımda son
+bit'leri oynayabiliyor; retrieval top-k'sı eşiğe yakın chunk'larda buna
+duyarlı. Yani yeniden üretilmiş bir korpus checksum'ı tutmaz ve pratikte
+üçüncü şıktaki duruma düşersin — üstelik ~1 saat CPU harcayarak. Sıfırdan
+üretmek sadece korpusu gerçekten değiştirmek istiyorsan anlamlı:
 
 ```bash
 python3 bench/build_corpus.py --tquad train-v0.1.json --out ./corpus
@@ -51,8 +82,8 @@ python3 bench/gen_trace.py --corpus ./corpus --out trace.jsonl \
 ```
 
 Üretilen her trace'in yanına bir `.manifest.json` yazılıyor ve o manifest'ler
-repoda commitli (`bench/*.manifest.json`) — hangi parametrelerle üretildiğini
-oradan doğrulayabilirsin.
+repoda commitli (`bench/*.manifest.json`) — karşı taraftaki trace'in hangi
+parametrelerle üretildiğini, checksum tutmasa bile oradan okuyabilirsin.
 
 ---
 
@@ -140,25 +171,31 @@ python3 smoke_test_overlap_adaptive.py
 python3 smoke_test_greedy_order.py
 python3 bench/cacheweaver_util.py
 
-# 2. Veri dosyaları yerinde mi + retrieval çalışıyor mu (GPU'suz, ~30 sn)
-python3 bench/overlap_measurement.py --corpus ~/bil401/data/corpus \
-    --trace ~/bil401/data/trace.jsonl --limit 400
+# 2. Veri parmak izi (anlik) -- 1. bolumdeki md5 tablosuyla karsilastir
+md5sum <veri-dizini>/corpus/corpus.jsonl <veri-dizini>/trace.jsonl
+
+# 3. Retrieval gercekten calisiyor mu (GPU'suz, ~30 sn)
+python3 bench/overlap_measurement.py --corpus <veri-dizini>/corpus \
+    --trace <veri-dizini>/trace.jsonl --limit 400
 #    -> session-adjacent mean 0.485, global-adjacent 0.053 çıkmalı.
 #       (Bu makinede 2026-08-15'te doğrulandı; tam 3000 istekte 0.476/0.055.)
-#       Belirgin şekilde farklıysa korpus ile trace birbirine ait değil.
 
-# 3. Router ayakta mı (vLLM gerekli)
+# 4. Router ayakta mı (vLLM gerekli)
 curl -s localhost:8080/health
 curl -s localhost:8080/router/state | head
 
-# 4. Kısa canlı koşu (--limit ile, GPU gerekli ama ucuz)
-cd bench && python3 replay.py --corpus ~/bil401/data/corpus \
-    --trace ~/bil401/data/trace.jsonl --limit 20 --order canonical --out /tmp/x.jsonl
+# 5. Kısa canlı koşu (--limit ile, GPU gerekli ama ucuz)
+cd bench && python3 replay.py --corpus <veri-dizini>/corpus \
+    --trace <veri-dizini>/trace.jsonl --limit 20 --order canonical --out /tmp/x.jsonl
 ```
 
-2. adım en değerlisi: veri dosyalarının birbirine ait olduğunu GPU'ya
-dokunmadan kanıtlıyor. Yanlış korpus/trace çifti canlı koşuda "düşük recall"
-olarak görünür ve kolayca stratejinin suçu sanılır.
+2. ve 3. adım ayrı ayrı duruyor çünkü ayrı şeyler kanıtlıyorlar. md5, karşı
+taraftaki dosyanın **buradakiyle aynı dosya** olduğunu söyler;
+`overlap_measurement.py` ise korpus ile trace'in **birbirine ait** olduğunu ve
+retrieval hattının çalıştığını söyler. İkincisi, checksum'lar tutmadığında
+(ör. bilerek yeni bir trace ürettiğinde) elindeki tek kontrol. Eşleşmeyen bir
+korpus/trace çifti canlı koşuda "düşük recall" olarak görünür ve kolayca
+stratejinin suçu sanılır.
 
 ---
 
@@ -187,7 +224,7 @@ W1_URL=http://localhost:8000 W2_URL=http://<peer>:8000 W2_ENABLED=true \
 
 # --- her kol için: vLLM restart, sonra ---
 cd bench
-python3 replay.py --corpus ~/bil401/data/corpus --trace ~/bil401/data/trace.jsonl \
+python3 replay.py --corpus <veri-dizini>/corpus --trace <veri-dizini>/trace.jsonl \
   --worker http://localhost:8000 --worker http://<peer>:8000 \
   --order canonical --out r_canon.jsonl
 #   ... --order relevance --out r_relevance.jsonl
