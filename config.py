@@ -165,20 +165,29 @@ SEMANTIC_CENTROID_LR: float = _env_float("ROUTER_SEMANTIC_CENTROID_LR", 0.15)
 # D_TARGET is the "normal" (pre-drift) session-adjacent overlap the detector
 # compares live readings against. MEASURED, not guessed -- same discipline as
 # LOAD_REF: run bench/overlap_measurement.py on your trace and use its
-# session-adjacent mean. On trace_hot.jsonl (zipf-s=1.5, session-len=4) that
-# was 0.529 (800 queries, 2026-07-30) -- re-measure for any other trace shape,
-# this number is a property of the workload, not the router.
-D_TARGET: float = _env_float("ROUTER_D_TARGET", 0.529)
+# session-adjacent mean. CORRECTED 2026-08-15 (bench/calibrate_cusum.py): the
+# original 0.529 was measured at top_k=3, but the detector runs against
+# top_k=10 traffic -- at the right top_k, on trace.jsonl, the real value is
+# 0.322. This is a property of (trace, top_k), not the router; re-measure for
+# any other trace shape or top_k.
+D_TARGET: float = _env_float("ROUTER_D_TARGET", 0.322)
 
 # EWMA learning rate for the live overlap estimate (OnlineDriftEstimator.lam).
 DRIFT_LAM: float = _env_float("ROUTER_DRIFT_LAM", 0.1)
 
 # CUSUM sensitivity margin and alarm threshold (CusumDriftDetector.k / .h).
-# Defaults are adaptive_drift_model.py's own self-test values, not yet
-# calibrated against a real multi-thousand-request live run -- see the open
-# item in today's report.
+# CALIBRATED 2026-08-15 against real traffic (bench/calibrate_cusum.py,
+# trace.jsonl vs trace_drift01.jsonl, top_k=10): the old default h=0.20 fired
+# on 10.9% of stable-traffic requests (108.76/1000) with only 1.52x
+# separation from genuine drift. h=0.30 cuts false alarms 4x (26.73/1000,
+# 2.7%) AND improves separation to 2.20x -- strictly better on both axes, not
+# a trade-off. k and lam were swept too and left unchanged; see the report
+# for the full budget/separation trade-off curve. Honest caveat carried over
+# from that calibration: even at the corrected setting, 2.20x separation on
+# ~2000 observations is a weak detector, not a strong one -- re-evaluate
+# before leaning on it for anything load-bearing.
 CUSUM_K: float = _env_float("ROUTER_CUSUM_K", 0.03)
-CUSUM_H: float = _env_float("ROUTER_CUSUM_H", 0.20)
+CUSUM_H: float = _env_float("ROUTER_CUSUM_H", 0.30)
 
 # --- cacheweaver_dualmap baseline thresholds --------------------------------
 # CacheWeaverDualMapRouter's own defaults (20_000 / 30_000) are borrowed from
