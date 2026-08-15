@@ -46,12 +46,31 @@ aşağıda placeholder bir hesap var, TODO ile işaretlendi.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import random
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from cacheweaver_util import CacheWeaverKnowledgeTree, build_hash_key
+
+# --------------------------------------------------------------------
+# OPT-IN worker-split asimetri arastirmasi icin log (BIL401, 2026-08-15).
+# Varsayilan davranisi DEGISTIRMEZ -- ROUTER_CWDM_TIE_LOG env var'i set
+# edilmedigi surece hicbir ekstra dosya yazilmaz, hicbir mevcut karar
+# etkilenmez. Sadece _slo_aware_select icindeki mevcut recompute_r1/r2
+# degerlerini (zaten hesaplaniyordu) ve secilen primary'yi jsonl'a
+# ekliyor -- routing mantigina TEK BIR SATIR bile eklenmedi.
+# --------------------------------------------------------------------
+_TIE_LOG_PATH = os.getenv("ROUTER_CWDM_TIE_LOG")
+
+
+def _append_tie_log(record: dict) -> None:
+    if not _TIE_LOG_PATH:
+        return
+    with open(_TIE_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _break_tie(a: int, b: int, val_a: float, val_b: float) -> Tuple[int, int]:
@@ -208,7 +227,8 @@ class CacheWeaverDualMapRouter:
     # Adım 5: SLO-aware seçim (DualMap §3.2)
     # ------------------------------------------------------------------
     def _slo_aware_select(
-        self, r1: int, r2: int, ordered_chunk_ids: Sequence[str]
+        self, r1: int, r2: int, ordered_chunk_ids: Sequence[str],
+        _log_ctx: Optional[dict] = None,
     ) -> Tuple[int, int, bool]:
         rep1, rep2 = self._replicas[r1], self._replicas[r2]
 
@@ -225,6 +245,16 @@ class CacheWeaverDualMapRouter:
         # gereken) adayı önce tercih et. Eşitlikte rastgele kırılır (bkz.
         # _break_tie docstring'i) -- r1'i sessizce kayırmak yerine.
         cache_pref_primary, cache_pref_second = _break_tie(r1, r2, recompute_r1, recompute_r2)
+
+        # OPT-IN log (bkz. dosya basindaki _append_tie_log) -- sadece
+        # ROUTER_CWDM_TIE_LOG set edilmisse yazar, mevcut kararı etkilemez.
+        if _log_ctx is not None:
+            _log_ctx.update({
+                "r1": r1, "r2": r2,
+                "recompute_r1": recompute_r1, "recompute_r2": recompute_r2,
+                "genuine_tie": recompute_r1 == recompute_r2,
+                "cache_pref_primary": cache_pref_primary,
+            })
 
         if rep1.is_overloaded(self._ttft_slo_threshold_tokens) if cache_pref_primary == r1 \
                 else rep2.is_overloaded(self._ttft_slo_threshold_tokens):
@@ -283,10 +313,15 @@ class CacheWeaverDualMapRouter:
         r1, r2, hash_key = self._select_candidates(ordered)
 
         # 3) SLO-aware seçim
-        primary, second, used_cache_affinity = self._slo_aware_select(r1, r2, ordered)
+        log_ctx = {"request_id": request_id, "hash_key": hash_key} if _TIE_LOG_PATH else None
+        primary, second, used_cache_affinity = self._slo_aware_select(r1, r2, ordered, _log_ctx=log_ctx)
 
         # 4) Hotspot rebalancing (sadece {primary, second} içinde)
         final_primary, migrated = self._maybe_rebalance(primary, second, ordered)
+
+        if log_ctx is not None:
+            log_ctx.update({"r1": r1, "final_primary": final_primary, "migrated": migrated})
+            _append_tie_log(log_ctx)
 
         return RoutingDecision(
             request_id=request_id,
