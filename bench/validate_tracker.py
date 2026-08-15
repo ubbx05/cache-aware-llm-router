@@ -57,24 +57,29 @@ def load(path: Path):
             np.array(prompt, dtype=float), rows, missing_belief, missing_actual)
 
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        raise SystemExit(__doc__)
-    path = Path(sys.argv[1])
-    b, a, p, rows, miss_b, miss_a = load(path)
+def compute(path: Path) -> dict:
+    """Metrics only, no printing -- so a sweep can aggregate them across runs
+    instead of re-parsing this script's console output. report() below turns
+    the same dict back into the text this file has always printed; there is
+    one implementation of the comparison, not two.
+
+    Raises SystemExit when there is nothing to compare, matching
+    score_quality.evaluate's convention so callers handle both the same way.
+    """
+    b, a, p_tok, rows, miss_b, miss_a = load(path)
 
     if len(b) == 0:
-        print(f"{path}: karsilastirilacak veri yok ({rows} basarili istek)")
+        msg = [f"{path}: karsilastirilacak veri yok ({rows} basarili istek)"]
         if miss_b:
-            print(f"  {miss_b} istekte router basligi yok "
-                  "-> istek routerdan gecmemis, ya da eski main.py calisiyor")
+            msg.append(f"  {miss_b} istekte router basligi yok "
+                       "-> istek routerdan gecmemis, ya da eski main.py calisiyor")
         if miss_a:
-            print(f"  {miss_a} istekte engine usage yok "
-                  "-> stream_options.include_usage gonderilmemis (eski replay.py)")
-        raise SystemExit(1)
+            msg.append(f"  {miss_a} istekte engine usage yok "
+                       "-> stream_options.include_usage gonderilmemis (eski replay.py)")
+        raise SystemExit("\n".join(msg))
 
     err = b - a
-    denom = np.where(p > 0, p, np.nan)
+    denom = np.where(p_tok > 0, p_tok, np.nan)
 
     # Pearson on the raw token counts. Requires both sides to vary; a run where
     # nothing was ever cached gives a degenerate result rather than a wrong one.
@@ -88,42 +93,53 @@ def main() -> None:
     # Sampled rather than all pairs, which would be O(n^2).
     rng = np.random.default_rng(0)
     n_pairs = min(20000, len(b) * (len(b) - 1) // 2) if len(b) > 1 else 0
-    concordant = 0
+    concordant = float("nan")
     if n_pairs:
         i = rng.integers(0, len(b), n_pairs)
         j = rng.integers(0, len(b), n_pairs)
         keep = i != j
         i, j = i[keep], j[keep]
-        same = np.sign(b[i] - b[j]) == np.sign(a[i] - a[j])
-        concordant = float(same.mean())
-
-    print(f"{path}")
-    print(f"  karsilastirilan istek : {len(b)} / {rows}")
-    if miss_b or miss_a:
-        print(f"  atlanan               : belief yok {miss_b}, usage yok {miss_a}")
-    print()
-    print(f"  router inanci   ort : {b.mean():8.1f} token")
-    print(f"  engine gercek   ort : {a.mean():8.1f} token")
-    print(f"  prompt          ort : {p.mean():8.1f} token")
-    print()
-    print(f"  korelasyon (Pearson): {corr:.3f}")
-    if n_pairs:
-        print(f"  siralama uyumu      : {concordant:.1%}  (rastgele cift ustunde)")
-    print(f"  ortalama sapma      : {err.mean():+8.1f} token  "
-          f"({'router fazla tahmin ediyor' if err.mean() > 0 else 'router az tahmin ediyor'})")
-    print(f"  MAE                 : {np.abs(err).mean():8.1f} token")
-    print(f"  MAE / prompt        : {np.nanmean(np.abs(err) / denom):8.1%}")
-    print()
+        concordant = float((np.sign(b[i] - b[j]) == np.sign(a[i] - a[j])).mean())
 
     over = float((b > a * 1.2).mean())
     under = float((b < a * 0.8).mean())
-    close = 1.0 - over - under
-    print(f"  %20 icinde tutan    : {close:.1%}")
-    print(f"  fazla tahmin        : {over:.1%}")
-    print(f"  az tahmin           : {under:.1%}")
 
+    return {
+        "n": len(b), "rows": rows, "miss_belief": miss_b, "miss_actual": miss_a,
+        "believed_mean": float(b.mean()), "actual_mean": float(a.mean()),
+        "prompt_mean": float(p_tok.mean()),
+        "corr": corr, "concordance": concordant,
+        "bias": float(err.mean()), "mae": float(np.abs(err).mean()),
+        "mae_frac": float(np.nanmean(np.abs(err) / denom)),
+        "over": over, "under": under, "close": 1.0 - over - under,
+    }
+
+
+def report(path: Path, d: dict) -> None:
+    print(f"{path}")
+    print(f"  karsilastirilan istek : {d['n']} / {d['rows']}")
+    if d["miss_belief"] or d["miss_actual"]:
+        print(f"  atlanan               : belief yok {d['miss_belief']}, "
+              f"usage yok {d['miss_actual']}")
     print()
-    if np.isnan(corr):
+    print(f"  router inanci   ort : {d['believed_mean']:8.1f} token")
+    print(f"  engine gercek   ort : {d['actual_mean']:8.1f} token")
+    print(f"  prompt          ort : {d['prompt_mean']:8.1f} token")
+    print()
+    print(f"  korelasyon (Pearson): {d['corr']:.3f}")
+    if d["concordance"] == d["concordance"]:
+        print(f"  siralama uyumu      : {d['concordance']:.1%}  (rastgele cift ustunde)")
+    print(f"  ortalama sapma      : {d['bias']:+8.1f} token  "
+          f"({'router fazla tahmin ediyor' if d['bias'] > 0 else 'router az tahmin ediyor'})")
+    print(f"  MAE                 : {d['mae']:8.1f} token")
+    print(f"  MAE / prompt        : {d['mae_frac']:8.1%}")
+    print()
+    print(f"  %20 icinde tutan    : {d['close']:.1%}")
+    print(f"  fazla tahmin        : {d['over']:.1%}")
+    print(f"  az tahmin           : {d['under']:.1%}")
+    print()
+    corr = d["corr"]
+    if corr != corr:
         print("  YORUM: bir taraf hic degismemis -- cache hic devreye girmemis olabilir.")
     elif corr > 0.8:
         print("  YORUM: tracker motoru iyi izliyor. cache_gain guvenilir bir sinyal,")
@@ -137,6 +153,13 @@ def main() -> None:
         print("         cache_gain'e dayanan tum routing sonuclari sorgulanmali.")
         print("         Ilk bakilacak yer: ROUTER_TOKENIZER=approx mi? Blok sinirlari")
         print("         motorunkiyle hizalanmiyorsa hash'ler bastan tutmaz.")
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        raise SystemExit(__doc__)
+    path = Path(sys.argv[1])
+    report(path, compute(path))
 
 
 if __name__ == "__main__":
