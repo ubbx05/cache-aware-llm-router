@@ -78,6 +78,26 @@ def run_replay(*a, **kw) -> None:
         raise
 
 
+def schedule_lag_p99(path: Path) -> float:
+    """Seconds the client was behind its own schedule at p99.
+
+    replay.py prints a warning about this and the sweeps capture its output,
+    so the warning was being swallowed -- which matters most at exactly the
+    loads where it fires. If the generator cannot keep up, the arrival pattern
+    it produced is not the trace's, and any claim about how the result varies
+    WITH LOAD is measuring the wrong load. Recomputed here from the same rows
+    rather than scraped from the captured text.
+    """
+    lags = sorted(r["sent_s"] - r["scheduled_s"]
+                  for r in map(json.loads, path.open(encoding="utf-8")))
+    if not lags:
+        return float("nan")
+    return lags[min(int(len(lags) * 0.99), len(lags) - 1)]
+
+
+LAG_WARN_S = 1.0  # replay.py's own threshold, kept identical on purpose
+
+
 @dataclass
 class Run:
     arm: str
@@ -88,6 +108,7 @@ class Run:
     ttft_p95: float = float("nan")
     load_cv: float = float("nan")
     contains: float = float("nan")
+    lag_p99: float = float("nan")
     n_ok: int = 0
     n_failed: int = 0
 
@@ -148,8 +169,12 @@ def one_run(args, arm: str, repeat: int) -> Run:
         run.contains = evaluate(out_path)["contains"]
     except SystemExit:
         pass  # no gold answers in this trace; cache metrics still stand
+    run.lag_p99 = schedule_lag_p99(out_path)
     print(f"  hit={run.hit_rate:.1%}  ttft_p50={run.ttft_p50:.3f}s  "
           f"quality={run.contains:.1%}  ({run.n_ok} ok, {run.n_failed} failed)")
+    if run.lag_p99 > LAG_WARN_S:
+        print(f"  !! schedule lag p99 = {run.lag_p99:.2f}s -- the client fell behind,")
+        print(f"     so this run's arrival pattern is NOT the trace's. Lower --speedup.")
     return run
 
 

@@ -51,9 +51,11 @@ sys.path.insert(0, str(BENCH_DIR))
 # no reason for a second copy to drift from them.
 from sweep_ordering import (  # noqa: E402
     ROUTER_PORT,
+    LAG_WARN_S,
     ArmSummary,
     confirm_restart,
     run_replay,
+    schedule_lag_p99,
 )
 from sweep_overlap_load import score_results, start_router, stop_router, wait_healthy  # noqa: E402
 from validate_tracker import compute  # noqa: E402
@@ -75,6 +77,7 @@ class TimingRun:
     over: float = float("nan")
     mae_frac: float = float("nan")
     hit_rate: float = float("nan")
+    lag_p99: float = float("nan")
     n: int = 0
 
 
@@ -112,8 +115,14 @@ def one_run(args, mode: str, repeat: int) -> TimingRun:
     run.bias, run.under, run.over = d["bias"], d["under"], d["over"]
     run.mae_frac, run.n = d["mae_frac"], d["n"]
 
+    run.lag_p99 = schedule_lag_p99(out_path)
     print(f"  corr={run.corr:.3f}  concordance={run.concordance:.1%}  "
           f"bias={run.bias:+.1f}tok  under={run.under:.1%}  ({run.n} compared)")
+    if run.lag_p99 > LAG_WARN_S:
+        # Load-dependence is this script's whole claim, so a load axis the
+        # client could not actually deliver invalidates the comparison it draws.
+        print(f"  !! schedule lag p99 = {run.lag_p99:.2f}s -- the client fell behind.")
+        print(f"     The load axis is not trustworthy at this --speedup.")
     return run
 
 
