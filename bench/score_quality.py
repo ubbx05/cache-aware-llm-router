@@ -17,6 +17,10 @@ fact is the thing a reviewer will catch.
 Usage:
     python score_quality.py r_canon.jsonl
     python score_quality.py r_canon.jsonl r_relevance.jsonl   # A/B
+    python score_quality.py r_canon.jsonl r_relevance.jsonl r_greedy.jsonl
+
+Any number of result files is accepted; every arm after the first is reported
+as a delta against the first, so put the baseline arm first.
 """
 from __future__ import annotations
 
@@ -106,20 +110,37 @@ def main() -> None:
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
 
-    a = evaluate(Path(sys.argv[1]))
-    show(sys.argv[1], a)
+    # N arms, not two. The ordering ablation grew a third arm (greedy) and a
+    # two-file main() would have scored the first two and silently dropped the
+    # third -- a missing arm looks exactly like an arm that was never run.
+    paths = [Path(a) for a in sys.argv[1:]]
+    scores = [evaluate(p) for p in paths]
 
-    if len(sys.argv) > 2:
-        b = evaluate(Path(sys.argv[2]))
-        print()
-        show(sys.argv[2], b)
-        print()
-        d = a["contains"] - b["contains"]
-        print(f"delta (contains) : {d:+.1%}")
+    for i, (path, s) in enumerate(zip(paths, scores)):
+        if i:
+            print()
+        show(str(path), s)
+
+    if len(paths) < 2:
+        return
+
+    # Every arm is compared against the FIRST one on the command line, so the
+    # baseline is whatever the caller put there rather than whichever pairing
+    # happens to look best -- the after-the-fact metric picking the module
+    # docstring warns about, applied to arms instead of metrics.
+    base_path, base = paths[0], scores[0]
+    print()
+    print(f"delta (contains) vs {base_path}:")
+    noisy = False
+    for path, s in zip(paths[1:], scores[1:]):
+        d = s["contains"] - base["contains"]
+        flag = "" if abs(d) >= 0.03 else "   <- within single-run noise"
+        noisy = noisy or abs(d) < 0.03
+        print(f"  {str(path):<28} {d:+.1%}{flag}")
+    if noisy:
         # A single run cannot separate a small effect from run-to-run noise.
         # Three runs per arm is the minimum before this difference means anything.
-        if abs(d) < 0.03:
-            print("  within noise for a single run -- repeat both arms ~3x before reporting")
+        print("  repeat the flagged arms ~3x before reporting any of them")
 
 
 if __name__ == "__main__":
