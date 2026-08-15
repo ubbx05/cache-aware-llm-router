@@ -14,9 +14,15 @@ This is the experiment harness. It owns four jobs:
    reuse by discarding the ranking, relevance keeps the ranking and gets no
    reuse -- and greedy claims to get reuse *without* fixing an order in
    advance. Whether that claim survives a real multi-worker deployment is
-   what `per_worker_tree` (the fourth arm) exists to test: greedy here has
-   exactly one tree for the whole cluster, so anything it believes is cached
-   may in fact be cached on the other replica.
+   what `per_worker_tree` exists to test: greedy here has exactly one tree
+   for the whole cluster, so anything it believes is cached may in fact be
+   cached on the other replica. `pinned_prefix` is the hybrid: it pins the
+   chunks this session was already served last turn at the front, in the
+   order they were served, and leaves the rest in relevance order. Where
+   canonical fabricates a shared prefix out of chunk ids and hopes it is
+   cached, pinned_prefix takes its prefix from the one signal this workload
+   actually has -- session-adjacent overlap averages 0.48 here against 0.055
+   globally -- and pays for it only in the tail.
 3. Timed dispatch -- fire each request at its scheduled offset regardless of
    whether earlier ones have finished. Waiting for completions would collapse
    the queue to depth one and the Load(w) term would never activate.
@@ -121,6 +127,16 @@ class Result:
     greedy_depth: int | None = None
     greedy_reordered: bool | None = None
 
+    # --order pinned_prefix only. `pinned_len` is how many chunks came from
+    # this session's previous turn and were therefore pinned to the front;
+    # 0 means the session had no usable history (its first turn, or a turn
+    # that re-retrieved nothing it had seen), in which case the arm is
+    # identical to `relevance` for that request. Recorded because the arm's
+    # entire premise is that this number is usually > 0 -- if it is mostly 0
+    # the hybrid never engaged and its result says nothing about the idea.
+    pinned_len: int | None = None
+    pinned_reordered: bool | None = None
+
     @property
     def actual_frac(self) -> float | None:
         if self.actual_cached_tokens is None or not self.prompt_tokens:
@@ -144,14 +160,16 @@ CHUNK_SEP = "\n\n<<<CHUNK>>>\n\n"
 def retrieve(corpus: Corpus, qvec: np.ndarray, k: int, order: str) -> list[int]:
     """Top-k by cosine similarity, then ordered according to the ablation arm.
 
-    per_worker_tree and greedy both get the same (unsorted-by-id) relevance
-    order as the "relevance" arm: their final order is decided later, from
-    cache state -- per-worker by /router/decide_order for the former, from the
-    harness-side global tree in fire_greedy() for the latter. What we send here
-    is only the retrieval-order candidate set they choose from, and it matters
-    that it *is* relevance order: greedy_reorder()'s fallback when nothing is
-    cached is "keep the input order", and protect_top_k pins the first K of it,
-    so both only mean "most relevant first" if this list is ranked.
+    per_worker_tree, greedy and pinned_prefix all get the same (unsorted-by-id)
+    relevance order as the "relevance" arm: their final order is decided later,
+    from state that does not exist yet -- per-worker by /router/decide_order,
+    from the harness-side global tree in fire_greedy(), from this session's
+    previous turn in fire_pinned(). What we send here is only the candidate set
+    they choose from, and it matters that it *is* relevance order:
+    greedy_reorder()'s fallback when nothing is cached is "keep the input
+    order", protect_top_k pins the first K of it, and pinned_prefix leaves its
+    whole tail in it -- so all three only mean "most relevant first" if this
+    list is ranked.
     """
     sims = corpus.embeddings @ qvec
     top = np.argpartition(-sims, min(k, len(sims) - 1))[:k]
@@ -430,6 +448,64 @@ async def fire_greedy(client: httpx.AsyncClient, args, rec: dict,
     return res
 
 
+def pinned_prefix_order(prev: list[str], chunk_ids: list[str]) -> tuple[list[str], int]:
+    """(ordered, n_pinned) for the pinned_prefix arm. Pure, so it can be
+    tested without a router: everything about this arm that could be silently
+    wrong lives here, not in the request plumbing around it.
+
+    `prev` is the order this session was served last turn; `chunk_ids` is this
+    turn's retrieval order. Chunks present in both go first IN PREV'S ORDER --
+    re-sorting them would defeat the point, since only a byte-identical prefix
+    is one the engine can match. The rest follow in relevance order.
+    """
+    pinned = [c for c in prev if c in set(chunk_ids)]
+    pinned_set = set(pinned)
+    tail = [c for c in chunk_ids if c not in pinned_set]
+    return pinned + tail, len(pinned)
+
+
+async def fire_pinned(client: httpx.AsyncClient, args, rec: dict,
+                      last_served: dict[int, list[str]], id_to_text: dict[str, str],
+                      chunk_ids: list[str], question: str, t0: float) -> Result:
+    """--order pinned_prefix: session-history prefix + relevance tail.
+
+    The chunks this session was served last turn, that this turn retrieved
+    again, go to the front in the order they were served last time; everything
+    else follows in relevance order. Reusing the PREVIOUS order for the pinned
+    part (rather than re-sorting it) is the whole point -- an identical prefix
+    is what the engine can actually match, and any re-sort would break it at
+    the first moved chunk.
+
+    The fallback is deliberate and not an edge case: a session's first turn has
+    no history, so pinned_len is 0 and this request is byte-identical to the
+    `relevance` arm. The arm is therefore never worse than relevance by
+    construction, and the interesting question is how often the pin engages.
+
+    State is keyed by session_id, which the trace provides directly, rather
+    than inferred from chunk overlap. Updating it at dispatch rather than
+    completion is safe here for a reason specific to this workload: gen_trace
+    puts ~8s of think time between turns of the same session, so a session's
+    turns never overlap in flight and there is no stale-state window to worry
+    about. On a trace with back-to-back same-session turns this choice would
+    need revisiting -- it is the same dispatch-vs-completion question the
+    router-side bookkeeping ablation asks.
+    """
+    session_id = rec["session_id"]
+    ordered, n_pinned = pinned_prefix_order(last_served.get(session_id) or [], chunk_ids)
+    last_served[session_id] = ordered
+
+    messages = [
+        {"role": "system",
+         "content": f"{SYSTEM_PROMPT}\n\nBağlam:\n\n" + "\n\n".join(id_to_text[c] for c in ordered)},
+        {"role": "user", "content": question},
+    ]
+
+    res = await fire(client, args, rec, messages, ordered, t0)
+    res.pinned_len = n_pinned
+    res.pinned_reordered = ordered != list(chunk_ids)
+    return res
+
+
 async def scrape_counters(client: httpx.AsyncClient, urls: list[str]) -> dict[str, float]:
     """Worker-side prefix cache counters, summed across workers."""
     wanted = ("vllm:prefix_cache_queries_total", "vllm:prefix_cache_hits_total",
@@ -478,15 +554,20 @@ async def run(args) -> None:
     greedy_tree = (CacheWeaverKnowledgeTree(cache_ttl_seconds=args.greedy_ttl)
                    if args.order == "greedy" else None)
 
+    # session_id -> the chunk order that session was last served. Empty at the
+    # start by design: every session's first turn falls back to relevance.
+    last_served: dict[int, list[str]] = {}
+
     plan = []
     for rec, qv in zip(trace, qvecs):
         idxs = retrieve(corpus, qv, args.top_k, args.order)
         chunk_ids = corpus.chunk_ids[idxs].tolist()
-        if args.order in ("per_worker_tree", "greedy"):
+        if args.order in ("per_worker_tree", "greedy", "pinned_prefix"):
             # Messages aren't built yet -- the final chunk order depends on
-            # cache state that does not exist yet. per_worker_tree resolves it
-            # in fire_two_phase() (which worker /router/decide_order picks),
-            # greedy in fire_greedy() (the global tree at dispatch time).
+            # state that does not exist yet. per_worker_tree resolves it in
+            # fire_two_phase() (which worker /router/decide_order picks),
+            # greedy in fire_greedy() (the global tree at dispatch time),
+            # pinned_prefix in fire_pinned() (this session's previous turn).
             plan.append((rec, None, chunk_ids, rec["query_text"]))
         else:
             plan.append((rec, build_messages(corpus, idxs, rec["query_text"]), chunk_ids, None))
@@ -513,6 +594,9 @@ async def run(args) -> None:
             elif args.order == "greedy":
                 tasks.append(asyncio.create_task(
                     fire_greedy(client, args, rec, greedy_tree, id_to_text, ids, question, t0)))
+            elif args.order == "pinned_prefix":
+                tasks.append(asyncio.create_task(
+                    fire_pinned(client, args, rec, last_served, id_to_text, ids, question, t0)))
             else:
                 tasks.append(asyncio.create_task(fire(client, args, rec, messages, ids, t0)))
         results = await asyncio.gather(*tasks)
@@ -577,6 +661,21 @@ def summarise(results, before, after, wall, args, out: Path) -> None:
         if fracs:
             print(f"engine cached    : mean={statistics.mean(fracs):.1%} of prompt tokens")
 
+    # The arm's premise, stated as a number. pinned=0 means the hybrid never
+    # engaged and the run is just `relevance` wearing another name -- which is
+    # a result about the trace's session structure, not about the idea.
+    if args.order == "pinned_prefix":
+        pins = [r.pinned_len for r in results if r.pinned_len is not None]
+        moved = sum(1 for r in results if r.pinned_reordered)
+        fracs = [r.actual_frac for r in ok if r.actual_frac is not None]
+        if pins:
+            print(f"pinned prefix    : mean={statistics.mean(pins):.2f} chunks  "
+                  f"engaged={sum(1 for n in pins if n > 0) / len(pins):.1%}  "
+                  f"full={sum(1 for n, r in zip(pins, results) if n == len(r.retrieved)) / len(pins):.1%}")
+            print(f"order changed    : {moved / len(results):.1%} of requests")
+        if fracs:
+            print(f"engine cached    : mean={statistics.mean(fracs):.1%} of prompt tokens")
+
     print(f"results          : {out}")
 
     if pct(lags, 99) > 1.0:
@@ -595,7 +694,8 @@ def main() -> None:
     p.add_argument("--worker", action="append", default=None,
                    help="worker base URL for cache counters; repeatable")
     p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    p.add_argument("--order", choices=["canonical", "relevance", "greedy", "per_worker_tree"],
+    p.add_argument("--order",
+                   choices=["canonical", "relevance", "greedy", "pinned_prefix", "per_worker_tree"],
                    default="canonical")
     p.add_argument("--greedy-protect-top-k", type=int, default=0,
                    help="--order greedy: pin the first K retrieval-ranked chunks in place, "
