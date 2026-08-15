@@ -75,14 +75,15 @@ def arrival_order_observations(trace: list[dict], sets: list[set]) -> list[float
     return obs
 
 
-def run_detector(obs: list[float], d_ref: float, lam: float, k: float, h: float) -> dict:
+def run_detector(obs: list[float], d_ref: float, lam: float, k: float, h: float,
+                 feed_ewma: bool = False) -> dict:
     """Replay one observation sequence through one parameter set."""
     est = OnlineDriftEstimator(lam=lam)
     det = CusumDriftDetector(d_ref=d_ref, k=k, h=h)
     alarms_at: list[int] = []
     for i, x in enumerate(obs):
         d_t = est.update(x)
-        if det.update(x, current_ewma_estimate=d_t):
+        if det.update(d_t if feed_ewma else x, current_ewma_estimate=d_t):
             alarms_at.append(i)
     return {
         "alarms": len(alarms_at),
@@ -120,6 +121,19 @@ def observations_for(label: str, path: Path, args, cache_dir: Path) -> list[floa
     return obs
 
 
+def separation(res: dict, stable: str, other: list[str]) -> float:
+    """How many times more often the detector fires on drifting traffic than
+    on steady traffic. This, not the raw alarm count, is what decides whether
+    the detector is informative: a setting can be admirably quiet on the
+    stable trace and equally quiet on the drifting one, which is silence, not
+    detection. 1.0 means the two regimes are indistinguishable.
+    """
+    s_rate = res[stable]["per_1000"]
+    if not other or s_rate <= 0:
+        return float("nan")
+    return statistics.fmean([res[l]["per_1000"] for l in other]) / s_rate
+
+
 def parse_floats(s: str) -> list[float]:
     return [float(x) for x in s.split(",") if x.strip()]
 
@@ -136,13 +150,18 @@ def main() -> None:
     p.add_argument("--k", default="0.02,0.03,0.05,0.08")
     p.add_argument("--h", default="0.10,0.15,0.20,0.30")
     p.add_argument("--max-false-per-1000", type=float, default=1.0,
-                   help="the rule: a parameter set is admissible only if the "
-                        "stable trace produces at most this many alarms per "
-                        "1000 observations")
+                   help="lowest false-alarm budget to report in the trade-off "
+                        "table; higher budgets are always shown alongside it")
     p.add_argument("--top-k", type=int, default=3)
     p.add_argument("--order", choices=["canonical", "relevance"], default="canonical")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--embed-model", default="intfloat/multilingual-e5-base")
+    p.add_argument("--feed-ewma", action="store_true",
+                   help="feed the CUSUM the smoothed EWMA instead of the raw "
+                        "Jaccard. Tested and rejected: it silences the detector "
+                        "(1-4 alarms per 2000 observations) on both traces "
+                        "rather than sharpening it. Kept so that result is "
+                        "reproducible, not because it should be used")
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
 
@@ -196,7 +215,7 @@ def main() -> None:
     for lam in parse_floats(args.lam):
         for k in parse_floats(args.k):
             for h in parse_floats(args.h):
-                res = {l: run_detector(o, d_ref, lam, k, h)
+                res = {l: run_detector(o, d_ref, lam, k, h, args.feed_ewma)
                        for l, o in obs_by_label.items()}
                 rows.append((lam, k, h, res))
 
@@ -204,6 +223,7 @@ def main() -> None:
     header = f"{'lam':>6}{'k':>7}{'h':>7}{stable + ' /1k':>16}"
     for l in other:
         header += f"{l + ' /1k':>16}"
+    header += f"{'sep':>10}"
     print("=" * len(header))
     print(header)
     print("=" * len(header))
@@ -211,38 +231,58 @@ def main() -> None:
         line = f"{lam:>6.2f}{k:>7.2f}{h:>7.2f}{res[stable]['per_1000']:>16.2f}"
         for l in other:
             line += f"{res[l]['per_1000']:>16.2f}"
+        line += f"{separation(res, stable, other):>9.2f}x"
         print(line)
 
-    # The rule, stated rather than eyeballed: among parameter sets quiet enough
-    # on stable traffic, take the one that fires most on drifting traffic.
-    admissible = [r for r in rows if r[3][stable]["per_1000"] <= args.max_false_per_1000]
-    print()
-    print(f"admissible (stable <= {args.max_false_per_1000:g}/1000): "
-          f"{len(admissible)}/{len(rows)} parameter sets")
-    if not admissible:
-        print("None. Every setting cries drift on steady traffic -- raise --h,")
-        print("raise --k, or accept a higher --max-false-per-1000 and say so.")
-        return
+    # A single recommendation hid the actual shape of this problem: the
+    # quietest admissible setting is often quiet on BOTH traces, i.e. mute.
+    # What matters is the trade-off, so it gets printed as one -- for each
+    # false-alarm budget, the best separation available at that budget.
     if not other:
+        print()
         print("Only a stable trace was given, so detection power is unmeasured.")
         print("Generate a drift trace (gen_trace.py --drift 0.1) and re-run;")
         print("without it these numbers only prove the detector stays quiet.")
         return
 
-    best = max(admissible, key=lambda r: statistics.fmean(
-        [r[3][l]["per_1000"] for l in other]))
-    lam, k, h, res = best
     print()
-    print("recommended:")
-    print(f"  ROUTER_DRIFT_LAM={lam:g}  ROUTER_CUSUM_K={k:g}  ROUTER_CUSUM_H={h:g}")
-    print(f"  ROUTER_D_TARGET={d_ref:.3f}")
-    print(f"  -> {res[stable]['per_1000']:.2f} false alarms/1000 on {stable}, "
-          + ", ".join(f"{res[l]['per_1000']:.2f}/1000 on {l}" for l in other))
-    sep = statistics.fmean([res[l]["per_1000"] for l in other]) - res[stable]["per_1000"]
-    if sep <= 0:
-        print("  WARNING: this fires no more on drift than on stable traffic.")
-        print("  The detector is not separating the regimes; adaptivity built on")
-        print("  it is not doing what it claims, whatever the parameters.")
+    print("trade-off (best separation available at each false-alarm budget):")
+    print(f"{'budget /1k':>12}{'best sep':>11}{'lam':>7}{'k':>7}{'h':>7}"
+          f"{'stable /1k':>13}")
+    budgets = [b for b in (1, 5, 10, 25, 50, 100, 1e9)
+               if b >= args.max_false_per_1000 or b == 1e9]
+    seen = set()
+    best_overall = None
+    for budget in budgets:
+        pool = [r for r in rows if r[3][stable]["per_1000"] <= budget]
+        if not pool:
+            continue
+        best = max(pool, key=lambda r: separation(r[3], stable, other))
+        lam, k, h, res = best
+        sep = separation(res, stable, other)
+        if (lam, k, h) in seen:
+            continue
+        seen.add((lam, k, h))
+        label = "any" if budget > 1e8 else f"{budget:g}"
+        print(f"{label:>12}{sep:>10.2f}x{lam:>7.2f}{k:>7.2f}{h:>7.2f}"
+              f"{res[stable]['per_1000']:>13.2f}")
+        if best_overall is None or sep > separation(best_overall[3], stable, other):
+            best_overall = best
+
+    print()
+    print(f"measured ROUTER_D_TARGET = {d_ref:.3f}  "
+          f"(top_k={args.top_k}, order={args.order})")
+    print("This is top_k-dependent -- calibrate it at the top_k you actually")
+    print("deploy, or the detector starts from the wrong reference.")
+
+    if best_overall is not None:
+        sep = separation(best_overall[3], stable, other)
+        if sep <= 1.05:
+            print()
+            print("WARNING: no setting fires meaningfully more on drift than on")
+            print("steady traffic. The detector is not separating the regimes on")
+            print("this workload, so adaptivity built on it is not doing what it")
+            print("claims -- a parameter choice cannot fix that.")
 
 
 if __name__ == "__main__":
