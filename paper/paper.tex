@@ -17,10 +17,10 @@
 % target, including \cite and \ref -- hidelinks keeps them clickable in the
 % PDF without the box/colour, which is what a print-ready submission wants.
 \hypersetup{hidelinks}
-% The Adobe Courier (pcr) metric files this TeX Live install would otherwise
-% pull in for \texttt are missing; Computer Modern Typewriter is always
-% bundled, so pin to it explicitly rather than depend on PSNFSS defaults.
-\renewcommand{\ttdefault}{cmtt}
+% Use the scalable Latin Modern Typewriter face for code identifiers. This
+% keeps IEEEtran's Times body face unchanged while avoiding bitmap Type 3
+% glyphs in the camera-ready PDF.
+\renewcommand{\ttdefault}{lmtt}
 
 \begin{document}
 
@@ -46,7 +46,7 @@ uboztas@etu.edu.tr}
 \IEEEauthorblockA{Dept.\ of Computer Engineering\\
 TOBB University\\
 of Economics and Technology\\
-Student ID: 231104080 \\
+Student ID: 231104088 \\
 demirdoruk.dilek@etu.edu.tr}
 }
 
@@ -58,24 +58,31 @@ large language model (LLM) replicas create a routing problem that plain
 load balancing ignores: which replica already holds the retrieved
 context in its KV prefix cache. We present a cache-aware request router
 placed transparently in front of an OpenAI-API-compatible vLLM
-deployment, and a family of seven interchangeable routing strategies
-unified under one scoring framework, ranging from cache-blind baselines
-to a worker-independent reordering tree with two pluggable
-overlap-adaptive weighting mechanisms (a simple threshold switch and an
-EWMA/CUSUM drift detector) and a semantic pre-filter that narrows the
-candidate replica set before an $O(k^2)$ reorder step. Every heuristic
-constant in the system (load reference points, prompt-token estimates,
-SLO thresholds, drift targets) is derived from on-hardware measurement
-rather than borrowed defaults. We report several results that would
-have been missed without this calibration discipline: recalibrating a
-single tracker-capacity constant reverses the direction of a core
-ablation's conclusion; a silent tie-break bias in a dual-hash baseline
-produces a load-balance asymmetry that looks like a modelling artifact
-but is a one-line code defect; and recording cache state at request
-completion rather than at dispatch time -- the theoretically "safer"
-choice -- measurably underperforms once queueing effects are accounted
-for. All strategies are validated both in isolated, GPU-free unit tests
-and on a live two-worker deployment.
+deployment. Seven selectable strategies share one framework, ranging
+from cache-blind baselines to worker-specific joint reordering, two
+experimental overlap-adaptive modes, and a semantic candidate
+pre-filter. Calibration experiments show that deployment-dependent
+constants must be measured on the target hardware; the ordering and
+timing sweeps' fixed, uncalibrated tracker capacity is a limitation. In a replicated four-arm
+ordering ablation at retrieval depth ten, cache-informed greedy ordering
+raises the mean per-request cached-token fraction from 65.0\% to 73.1\%
+and reduces median time to first token (TTFT) by 28\% relative to
+canonical ordering; its primary answer-quality score is not separated
+from relevance order under the prespecified spread rule. Tracker-capacity calibration can reverse a routing ablation's
+conclusion, while replicated timing tests show that completion-time
+cache bookkeeping deteriorates as concurrency rises whereas
+dispatch-time bookkeeping remains stable. Trace-driven calibration also
+corrects the drift reference and CUSUM threshold, although the resulting
+detector remains only moderately discriminative and does not control
+routing. Live two-worker tests cover the flat-prompt policies and the
+base two-phase worker-and-order path. That path establishes protocol
+operation, not a performance advantage: \texttt{per\_worker\_tree} is
+absent from the four-arm ablation, whose greedy arm uses one global,
+worker-blind tree. Whether worker-specific trees outperform that global
+baseline therefore remains open. Semantic filtering and token-weighted
+worker scoring remain prototypes, and current two-phase TTFT excludes
+the preliminary decision call. These boundaries are reported explicitly
+rather than treated as completed evaluations.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -108,41 +115,55 @@ sophistication. The starting point is a single scoring function,
 of which round-robin, pure load balancing, and a cache-aware policy
 with an adaptive guard band are all degenerate special cases
 ($\alpha{=}\beta{=}0$ plus rotation; $\alpha{=}0$; and the full form,
-respectively). We extend this baseline in four largely independent
-directions and ablate each one:
+respectively). We extend this baseline in four directions, reporting
+live and isolated validation separately:
 
 \begin{enumerate}
-  \item \textbf{Worker-independent joint reordering.} A per-worker
+  \item \textbf{Worker-specific joint reordering.} A per-worker
   variant of the CacheWeaver~\cite{cacheweaver2026} knowledge tree
   replaces DualMap's~\cite{dualmap2026} dual-hash candidate selection,
   which we show degenerates to a no-op at $n{=}2$ replicas -- exactly
-  the deployment size used throughout this work.
-  \item \textbf{Overlap-adaptive weighting.} Two independent mechanisms
-  -- a threshold switch and an EWMA+CUSUM drift detector -- convert a
-  live, consecutive-request Jaccard-overlap signal into a dynamic
-  $(\alpha,\beta)$ pair, and are ablated against each other under a
-  \emph{controlled} design: both consume the same input signal, so any
-  difference between them is attributable to the adaptation mechanism
-  alone.
-  \item \textbf{Semantic candidate pre-filtering.} A lightweight,
-  pre-retrieval embedding classifier narrows the candidate replica set
-  from $N$ to $k{\ll}N$ before the $O(k^2)$ reorder step is paid,
-  addressing a gap we identify in the routing literature (Section~II).
-  \item \textbf{Calibration.} Every constant that would otherwise be a
-  guess -- the load-normalisation reference point, the average
-  prompt-token estimate feeding a token-budget-aware baseline, SLO and
-  rebalancing thresholds, and the drift detector's target overlap level
-  -- is measured on the actual two-machine deployment rather than
-  copied from a paper's own hardware.
+  the deployment size used throughout this work. The live experiment
+  validates the joint protocol, while its performance relative to one
+  global tree remains an explicit open comparison.
+  \item \textbf{Overlap-adaptive weighting.} A threshold switch and an
+  EWMA-driven weighting mode are implemented, with CUSUM used as a drift
+  diagnostic. The detector is calibrated offline on arrival-ordered
+  workload traces, but its state and the per-worker mode's input stream
+  still differ; no controlled live adaptive ablation is claimed.
+  \item \textbf{Semantic candidate pre-filtering.} A pre-retrieval
+  embedding classifier prototype can rank replicas before the
+  $O(k^2)$ reorder step. Query text is not yet carried by the live
+  two-phase endpoint, and at the present $N{=}2$, top-$k{=}2$ setting it
+  cannot reduce the candidate set.
+  \item \textbf{Calibration and controlled ablations.} Load reference,
+  average prompt size, SLO/rebalancing thresholds, drift target, CUSUM
+  threshold, and tracker capacity are measured rather than borrowed.
+  Repeated ordering and bookkeeping sweeps rotate arm order, cold-reset
+  both engines and the router, and verify that the replay client keeps
+  its requested arrival schedule.
 \end{enumerate}
 
 The calibration discipline turns out not to be a formality. Section~VI
-reports a case where recalibrating a single constant
-(\texttt{TRACKER\_CAPACITY}) reverses which of two policies wins a
-head-to-head comparison at every load level tested, and a case where a
-one-line tie-break defect in a baseline router silently locked a
-$\sim$67/33 worker split for the same reason that other parts of this
-codebase deliberately randomise ties.
+reports a load point where recalibrating \texttt{TRACKER\_CAPACITY}
+reverses which of two policies wins, and a one-line tie-handling defect
+that always preferred the hash-assigned first candidate. The latter is
+a plausible contributor to a stable asymmetric live split, but the
+current evidence does not establish it as the sole cause.
+
+The ordering ablation further separates cache-informed ordering from
+ordering rules that do not observe cache state. At retrieval depth ten,
+the retriever's relevance order outperforms both canonical sorting and a
+session-history prefix, while the cache-informed greedy policy is the
+only arm that improves on relevance order. This reframes the empirical
+question from whether chunks should be reordered to whether the ordering
+rule has an accurate cache signal.
+
+Critically, the four-arm ordering ablation evaluates one global,
+worker-blind greedy tree under a fixed router; it does not include the
+paper's \texttt{per\_worker\_tree} strategy. It therefore shows that
+cache-history-informed ordering can help, but not that worker-specific
+joint routing and ordering adds value beyond global greedy.
 
 The question at the centre of this work can be stated directly: in a
 distributed LLM serving cluster, can reordering a RAG request's
@@ -159,16 +180,20 @@ CacheWeaver's~\cite{cacheweaver2026} own finding that reordering gains
 depend strongly on document-overlap rate and vanish in low-overlap
 regimes such as HotpotQA.
 
+The present evaluation answers only a prerequisite question: whether a
+history-informed order can outperform cache-oblivious orders under fixed
+routing. It does not yet answer the stronger joint question of whether
+per-worker trees outperform one global tree; that remains a system-design
+hypothesis and the first item of future work.
+
 \section{Related Work}
 
 Three largely separate literature threads intersect with this work:
 distributed cache-affinity routing, RAG-specific cache reuse, and
-adaptive/semantic parameter tuning. Of the 18 papers reviewed in this
-project's literature survey, 15 are cited directly below (four
-implemented against or matched feature-for-feature, the remainder
-positioned in Table~\ref{tab:relatedwork}); vLLM~\cite{kwon2023vllm}
-underlies the serving engine itself and is discussed separately at the
-end of this section.
+adaptive/semantic parameter tuning. Table~\ref{tab:relatedwork}
+positions the systems most relevant to the implementation;
+vLLM~\cite{kwon2023vllm} underlies the serving engine and is discussed
+separately at the end of this section.
 
 \subsection{Distributed Cache-Affinity Routing}
 
@@ -215,9 +240,10 @@ method that reorders retrieved chunks into a cache-friendly sequence
 via a greedy prefix-tree walk (its Algorithm~1), reported to reach
 97.5\% of an oracle ordering's reusable-prefix depth.
 
-This thread solves RAG-specific reordering but \emph{assumes a single
-serving instance}: none of these systems include a distributed
-worker-selection component.
+This thread addresses RAG-specific cache reuse; CacheWeaver is the
+member that specifically reorders retrieved evidence. The listed
+systems assume a single serving instance and do not include distributed
+worker selection.
 
 \subsection{Adaptive Tuning and Semantic Approaches}
 
@@ -240,9 +266,10 @@ merely costing extra prefill).
 \caption{Related work compared along three axes}
 \label{tab:relatedwork}
 \centering
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{@{}lccc@{}}
 \toprule
-\textbf{System} & \textbf{Dist.\ routing} & \textbf{RAG reorder} & \textbf{Adaptive} \\
+\textbf{System} & \textbf{Dist.\ routing} & \textbf{RAG cache reuse} & \textbf{Adaptive} \\
 \midrule
 Preble~\cite{preble2025} & \checkmark & $\times$ & partial (threshold) \\
 Mooncake~\cite{mooncake2025} & \checkmark & $\times$ & $\times$ \\
@@ -257,7 +284,8 @@ GORGO~\cite{gorgo2026} & \checkmark & $\times$ & \checkmark (evolutionary) \\
 Semantic caching & $\times$ & $\times$ & $\times$ \\
 \textbf{This work} & \checkmark & \checkmark & \checkmark (overlap-adaptive) \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
 This paper combines distributed routing (Section~III-A/B/D) with
@@ -269,20 +297,17 @@ knowledge no system in the surveyed literature addresses this
 specific dependency -- whether to reorder before or after choosing a
 worker changes which ordering is actually optimal, since two replicas'
 caches generally disagree on what is cache-friendly (Section~III-C).
-Techniques from Section~III-C above (adaptive tuning, semantic
+Techniques from Section~II-C above (adaptive tuning and semantic
 selection) are borrowed as extended evaluation components layered on
 top of this core design, not presented as this paper's primary
 contribution.
 
-RAGRoute~\cite{ragroute2026} and Adaptive-RAG are related in spirit
-but orthogonal in target: both demonstrate that a cheap classifier run
-\emph{before} retrieval -- deciding which data source or retrieval
-strategy to use in under 30\,ms -- measurably improves federated RAG
-pipelines, but neither applies this idea to \emph{which replica's KV
-cache} is relevant to an incoming query, decided before the retrieval
-step that would otherwise be needed to know which chunks -- and hence
-which cache -- are relevant at all. Section~III-F describes the
-semantic pre-filter built to close this specific gap.
+RAGRoute~\cite{ragroute2026} is related in spirit but orthogonal in
+target: it uses a lightweight classifier before retrieval to choose
+which federated data sources to query. It does not decide which LLM
+replica's KV cache is most relevant to an incoming query. Section~III-F
+describes the prototype semantic pre-filter explored for that distinct
+decision.
 
 \textbf{Serving infrastructure.} vLLM~\cite{kwon2023vllm} provides the
 underlying PagedAttention KV-cache engine and the OpenAI-compatible API
@@ -318,12 +343,30 @@ resident once prefill starts) or at completion time (conservative: only
 once the engine has actually finished) -- and Section~VI-E reports the
 result of ablating between them.
 
+\begin{figure}[t]
+\centering
+\fbox{\begin{minipage}{0.92\columnwidth}
+\centering\small
+Client/retriever: query + unordered chunk ids\\
+$\downarrow$ \texttt{/router/decide\_order}\\
+Router: choose worker + worker-specific order\\
+$\downarrow$ returned worker and ordered ids\\
+Client: assemble the ordered prompt\\
+$\downarrow$ forced completion request\\
+Selected vLLM worker
+\end{minipage}}
+\caption{Current client-mediated two-phase path. The client applies the
+returned order; the completion-phase timer starts after the decision
+call in the present replay harness.}
+\label{fig:two-phase}
+\end{figure}
+
 \subsection{Strategy Framework}
 
-All strategies implement a single interface,
+All registered strategies share a common interface,
 \texttt{select(context, snapshot) -> Decision}, so that switching the
-active policy is a configuration change rather than a code change. The
-five directly comparable baselines are:
+active policy is a configuration change rather than a code change. Five
+policies use the ordinary one-phase proxy path:
 
 \begin{itemize}
   \item \textbf{round\_robin}: $\alpha{=}\beta{=}0$, plus a rotating
@@ -333,7 +376,7 @@ five directly comparable baselines are:
   $\text{load\_norm}(w) = \text{load}(w) / (\text{load}(w) +
   \text{LOAD\_REF})$, chosen over a clipped $\min(\cdot,1)$ form because
   clipping destroys the policy's discriminative power once both
-  replicas exceed the reference load (Section~IV-B).
+  replicas exceed the reference load (Section~IV-C).
   \item \textbf{cache\_aware}: the full scoring function plus an
   \emph{adaptive guard band}, $\delta = \delta_0 \cdot (1 -
   \overline{\text{kv\_usage}})$: the winning replica by score is
@@ -343,14 +386,20 @@ five directly comparable baselines are:
   popular prefix keeps attracting traffic until its queue makes it the
   worst choice by latency despite remaining the best choice by cache.
   \item \textbf{adaptive\_cache\_aware}: \texttt{cache\_aware} with
-  $\beta$ and $\delta_0$ driven live by an EWMA/CUSUM drift detector
-  (Section~III-E) observing session-adjacent retrieved-chunk-set
-  overlap, rather than the fixed constants above.
-  \item \textbf{cacheweaver\_dualmap}: the DualMap-style baseline
+  $\beta$ and $\delta_0$ driven by an overlap EWMA, while a CUSUM
+  detector records diagnostic drift alarms (Section~III-E).
+  \item \textbf{cacheweaver\_dualmap}: the DualMap-inspired two-choice
+  prototype
   described in Section~III-D.
 \end{itemize}
 
-\subsection{Worker-Independent Joint Reordering (\texttt{per\_worker\_tree})}
+The two remaining registry entries, \texttt{per\_worker\_tree} and
+\texttt{semantic\_per\_worker\_tree}, expose the separate decision
+capability described next. This registry taxonomy must not be confused
+with the arms of any one experiment: Section~VI-J isolates order under
+fixed routing, while Section~IX defines the missing system comparison.
+
+\subsection{Worker-Specific Joint Reordering (\texttt{per\_worker\_tree})}
 
 DualMap's replica candidate-selection step (its Eq.~5) hashes the
 reordered chunk sequence through two independent consistent-hashing
@@ -377,31 +426,28 @@ the worker decision, since the two replicas' trees generally disagree
 about which order is cache-friendly.
 
 Because the winner and its optimal chunk order are decided together, a
-two-phase client protocol is used: the client first calls
+client-mediated two-step protocol is used (Fig.~\ref{fig:two-phase}).
+The client first calls
 \texttt{/router/decide\_order} with the unordered, retrieval-order
 chunk ids and receives back \{worker, ordered\_chunk\_ids\}; it then
-issues the real completion request with an
-\texttt{x-router-force-worker} header, and the router rewrites the
-prompt server-side into the returned order before forwarding. This
-keeps the reordering decision and the worker decision atomic without a
-second network hop from the router's perspective.
+builds the prompt in that returned order and issues the completion with
+an \texttt{x-router-force-worker} header. The router forwards this
+already ordered prompt to the named worker. Phase-one bookkeeping is
+optimistic: the tree is updated before phase two succeeds, so the two
+HTTP calls are not transactional.
 
-\subsubsection{Token-weighted cache gain} An early implementation
-measured cache gain as the \emph{count} of chunks matched against a
-worker's cached prefix, not their token length. Because this
-project's corpus preserves natural, variable-length paragraphs (chunks
-range from 9 to 754 tokens after block-alignment padding, mean 182,
-$\sigma{=}108$; Section~IV-A), a worker holding two large chunks (say,
-1{,}100 tokens combined) can lose to a worker holding three small ones
-(300 tokens combined) under count-based accounting, despite the first
-worker offering nearly four times the real prefill saving. We replaced
-chunk-count accounting with token accounting,
-$\text{gain} = \text{hit\_tokens} / \text{total\_tokens}$, computed by
-reusing the router's own tokenizer (never a second, redundant load).
-A synthetic regression test constructs exactly this
-few-large-vs-many-small scenario and asserts that the token-weighted
-and count-weighted computations select different workers, proving the
-fix has real effect rather than being a no-op relabelling.
+\subsubsection{Token-weighted cache gain} The router module has an
+optional token-weighted path,
+$\text{gain}=\text{hit\_tokens}/\text{total\_tokens}$, for cases where
+the caller supplies a chunk-id-to-text mapping. It reuses the existing
+tokenizer and a synthetic regression test confirms that few large
+chunks and many small chunks can select different workers. This path is
+\emph{not live-integrated}: \texttt{/router/decide\_order} currently
+accepts only chunk ids, and the strategy calls the module without chunk
+texts. Consequently each chunk has weight one on the live HTTP path and
+all reported live \texttt{per\_worker\_tree} traffic remains
+chunk-count-based. Section~VI-G is therefore an isolated functional
+test, not a measured live improvement.
 
 \subsubsection{Quality protection (\texttt{protect\_top\_k})} Pure
 greedy reordering can push a highly relevant but uncached chunk to the
@@ -410,82 +456,77 @@ the front -- a risk CacheWeaver's own evaluation does not fully rule
 out (its Table~7 states only that reordering \emph{did not measurably
 hurt} answer quality in their setting, not that it never can).
 \texttt{protect\_top\_k} pins the first $K$ retrieval-order chunks in
-place, unconditionally, and reorders only what follows; $K{=}0$
-reproduces the original behaviour exactly. A regression test
-constructs a case where the single most relevant retrieved chunk is
-not cached: with $K{=}0$ it is demonstrably pushed out of first
-position by a cached-but-less-relevant chunk, and with $K{=}1$ it stays
-first.
+the returned list and reorders only what follows; $K{=}0$ reproduces the
+original behaviour. A regression test verifies this positional
+property. It does not establish that the post-pinned traversal remains
+one cache-contiguous prefix when a pinned chunk is absent from the
+tree, nor does it establish answer quality; both require end-to-end
+validation.
 
 \subsection{The \texttt{cacheweaver\_dualmap} Baseline and a Tie-Break Defect}
 
-DualMap's official implementation (\url{github.com/ASISys/DualMap},
+DualMap's official implementation (\url{https://github.com/ASISys/DualMap},
 MIT-licensed, which also incorporates Preble) is publicly available,
 but was not used directly: it is written against an 8+-GPU, 512\,GB-DRAM
 reference deployment and consumes Mooncake-format traces (fixed
 prefixes, no real retrieval step), neither of which matches this
 project's two-machine RAG deployment with genuine per-query retrieval.
-The routing logic itself -- dual-hash candidate selection (Eq.~5),
-migration benefit (Eq.~6), and SLO-aware routing -- was therefore
-reimplemented independently against this codebase, honestly labelled
-\texttt{cacheweaver\_dualmap} throughout this paper as \emph{our
-DualMap-equivalent implementation}, not as a run of the official
-release. Our independent reimplementation of DualMap fixes a bug present in an
-earlier internal version, where the shared knowledge tree used for
-CacheWeaver's reordering decision was also used for DualMap's
-per-replica cache-hit estimate; since both candidate replicas were then
-scored against the \emph{same} tree, the two recompute-cost estimates
-were always equal, and the router's cache-affinity term degenerated
-into always preferring the first candidate until it became overloaded.
-Giving each replica its own tree fixes this, but exposed a second,
-subtler defect described in Section~VI-F: the candidate comparison used
-a non-strict inequality (\texttt{recompute\_r1 <= recompute\_r2}),
-so \emph{any} tie -- common, since both trees are frequently equally
-cold or equally warm -- was silently resolved in favour of the
-hash-assigned $r_1$ candidate rather than broken at random, exactly the
-class of bias the rest of this codebase's tie-breaking logic (its
-$\text{argmax}$ helper and \texttt{per\_worker\_tree}'s own comparison)
-was written specifically to avoid.
+The local \texttt{cacheweaver\_dualmap} strategy is therefore a
+\emph{DualMap-inspired two-choice prototype}, not an equivalent
+reimplementation. It uses two independent BLAKE2b-modulo mappings
+rather than consistent-hash rings, estimates recompute cost with a
+fixed 200-token-per-chunk placeholder, and derives pending-token load
+from vLLM's waiting-request gauge. On the documented vLLM V1 setup that
+gauge can remain zero under load, so SLO/rebalancing activation has not
+been demonstrated. Moreover, although the inner prototype computes a
+CacheWeaver order, the enclosing strategy does not propagate that order
+to the proxy's prompt-rewrite field; vLLM therefore receives the
+original prompt order in the reported one-phase runs. Results bearing
+this strategy name evaluate its current two-choice routing and internal
+bookkeeping, not live CacheWeaver reordering or a faithful DualMap run.
+
+An earlier internal version also used one shared tree for both
+replicas, making their recompute estimates identical. Per-replica trees
+fixed that error but exposed a separate tie defect: non-strict
+comparisons always selected the hash-assigned $r_1$ when estimates tied.
+The current implementation randomises this candidate tie; Section~VI-F
+describes the corresponding GPU-free regression test.
 
 \subsection{Overlap-Adaptive Weighting}
 
-A single signal underlies two independent adaptation mechanisms: the
-Jaccard overlap $J(A,B) = |A \cap B| / |A \cup B|$ between the
-retrieved chunk set of the current request and that of the previous
-one. This is the same definition used by the project's offline
-overlap-characterisation tool (Section~IV-C), imported rather than
-reimplemented, so live and offline measurements of "how much locality
-is available right now" are guaranteed comparable.
+A common formula underlies the adaptive modes: Jaccard overlap
+$J(A,B)=|A\cap B|/|A\cup B|$. The current call sites do \emph{not},
+however, observe the same stream. \texttt{adaptive\_cache\_aware}
+compares adjacent requests within each session, whereas
+\texttt{per\_worker\_tree}'s modes compare globally adjacent requests
+and initialise the first comparison against an empty set. The offline
+tool reports both notions separately (Section~IV-D); sharing a formula
+does not make their calibrated values interchangeable.
 
 \textbf{Threshold mode.} A one-line switch: $\alpha{=}0.2,\ \beta{=}0.8$
 when $J$ falls below a configured threshold (locality is a weak
 signal, weight load instead), and $\alpha{=}0.8,\ \beta{=}0.2$
 otherwise, with $\alpha+\beta{=}1$ by construction.
 
-\textbf{EWMA/CUSUM mode.} An exponentially weighted moving average
+\textbf{EWMA with CUSUM diagnostics.} An exponentially weighted moving average
 tracks a smoothed overlap estimate $D_t = \lambda J_t + (1-\lambda)
-D_{t-1}$; a CUSUM detector accumulates deviation below a reference
-level $D_{\text{ref}}$ and, once the accumulated statistic exceeds a
-threshold $h$, declares a drift event and \emph{recalibrates}
-$D_{\text{ref}}$ to the current EWMA estimate. Without this
-recalibration step, a detector tuned to a pre-drift regime keeps firing
-indefinitely in the new regime -- a failure mode caught during
-self-testing of an earlier version, where every request from $t{=}50$
-onward triggered an alarm because $D_{\text{ref}}$ was never updated.
-The recalibrated estimate feeds
+D_{t-1}$. This EWMA, together with the fixed configured
+$D_{\text{target}}$, feeds
 $\beta_{\text{live}} = \beta_{\text{base}} \cdot \text{clip}\!\left(1 +
 k\cdot\frac{D_{\text{target}} - D_t}{D_{\text{target}}},\,
-[0.3, 3.0]\right)$, while $\alpha$ is held fixed -- mirroring how the
-same mechanism is used by \texttt{adaptive\_cache\_aware} to drive
-$\beta$ and the guard band $\delta_0$, but as a fully independent
-estimator instance with its own state.
-
-Both modes are deliberately fed the \emph{same} consecutive-pair
-signal (rather than, say, letting the EWMA/CUSUM mode use
-\texttt{adaptive\_cache\_aware}'s session-adjacent variant) so that a
-comparison between them isolates the adaptation mechanism as the only
-variable. Both default to disabled, reproducing the fixed-$\alpha,\beta$
-baseline exactly.
+[0.3, 3.0]\right)$, while $\alpha$ is held fixed. A CUSUM detector is
+updated alongside it and recalibrates its own alarm reference, but the
+returned alarm and recalibrated reference are not consumed by routing.
+CUSUM is therefore observational telemetry in the current code, not a
+second decision input. Offline calibration now reconstructs the exact
+arrival-ordered, within-session stream observed by
+\texttt{adaptive\_cache\_aware}; at retrieval depth ten this gives
+\texttt{D\_TARGET=0.322} and favours \texttt{CUSUM\_H=0.30} over the
+previous 0.20 default. The per-worker mode still consumes global
+adjacency, so the calibrated target is not transferable to that path.
+GPU-free tests verify that \texttt{off} reproduces the fixed baseline
+and that threshold/EWMA inputs can change a synthetic decision; no live
+comparative result is claimed.
 
 \subsection{Semantic Candidate Pre-Filtering}
 
@@ -495,8 +536,8 @@ $n \cdot O(k^2)$ across all healthy workers -- cheap at $n{=}2$, not
 necessarily cheap beyond it. \texttt{SemanticWorkerRouter} addresses
 this independently of locality-based weighting: each worker's recent
 query traffic is summarised as an EWMA centroid in embedding space
-(\texttt{multilingual-e5-base}, the same model used for corpus
-retrieval, loaded once and shared rather than duplicated); an incoming
+(\texttt{multilingual-e5-base}, the same checkpoint used for corpus
+retrieval, loaded once per router process); an incoming
 query is embedded and ranked by cosine similarity against each
 worker's centroid, and only the top-$k$ ranked workers are passed to
 \texttt{per\_worker\_tree}'s comparison. A worker with no observed
@@ -510,22 +551,21 @@ starve a request. Loading the embedding model is forced synchronously
 at router start-up rather than being paid by whichever live request
 happens to arrive first.
 
-A documented limitation: this pre-filter is designed to run
-\emph{before} retrieval, but the live two-phase protocol
-(Section~III-C) currently carries only chunk ids to
-\texttt{/router/decide\_order}, not the original query text, so on the
-live path the filter degrades gracefully to "no filtering" (every
-healthy worker is a candidate) rather than being exercised. It is
-validated in isolation (Section~VI-H) and end-to-end against live
-traffic when driven directly with query text; wiring query text through
-the live HTTP protocol is future work (Section~VIII).
+The current deployment cannot exercise the intended pre-filter. The
+two-phase endpoint carries chunk ids but not query text, so that path
+falls back to every healthy worker. In addition, the default
+\texttt{SEMANTIC\_TOP\_K=2} equals the entire two-worker pool and cannot
+prune candidates even if query text is supplied. The ranking logic is
+tested in isolation and model warm-up was observed separately, but a
+semantic filtering benefit requires a revised protocol and $N>k$.
 
 \section{Implementation Details}
 
 \subsection{Corpus and Trace Construction}
 
-The RAG corpus is built from TQuAD, a SQuAD-format Turkish
-question-answering dataset (681 articles, 8{,}308 questions). Each
+The RAG corpus is built from the publicly available TQuAD
+dataset~\cite{tquad}, a SQuAD-format Turkish question-answering resource
+(681 articles, 8{,}308 questions). Each
 question already points at exactly one source paragraph, so using the
 paragraph as the retrieval chunk gives retrieval ground truth "for
 free". Paragraphs are split at sentence boundaries only when they
@@ -535,10 +575,11 @@ unpredictably) to a multiple of vLLM's KV-cache block size, since a
 chunk boundary that does not align with a block boundary produces a
 different block hash even when the underlying content is shared,
 silently breaking the prefix chain the whole system depends on. The
-resulting corpus contains 2{,}619 chunks; chunk length after padding
-ranges from 9 to 754 tokens (mean 182.2, $\sigma{=}108.5$), confirming
-that the corpus is \emph{not} fixed-length and motivating the
-token-weighting fix of Section~III-C.1.
+resulting corpus contains 2{,}619 chunks. Before padding, lengths range
+from 9 to 754 tokens (mean 182.2, $\sigma{=}108.5$); after padding they
+range from 16 to 768 tokens (mean 189.6, $\sigma{=}108.4$). The
+variation motivates the token-weighted prototype of Section~III-C.1,
+but that prototype is not yet connected to live requests.
 
 Synthetic request traces are generated once per experiment and replayed
 identically across every strategy under comparison, so that strategies
@@ -554,32 +595,52 @@ the ranking over the course of a trace, exercising the scenario an
 adaptive policy is meant to handle and a static one is meant to
 degrade gracefully under.
 
+\subsection{Software and Deployment Platform}
+
+The implementation is written in Python and uses FastAPI and Uvicorn for
+the OpenAI-compatible reverse proxy, \texttt{httpx} for asynchronous
+stream forwarding and worker polling, and \texttt{prometheus-client}
+for router instrumentation. Each upstream runs vLLM with
+Qwen2.5-7B-Instruct; the two workers communicate with the router over a
+private Tailscale network. Hugging Face Transformers supplies the
+serving-model tokenizer, \texttt{multilingual-e5-base} supplies corpus
+and query embeddings, and NumPy stores and scores the offline embedding
+matrix. The submission also contains replay, trace-generation,
+calibration, quality-scoring, schedule-lag, and GPU-free regression
+scripts. Runtime parameters, worker addresses, strategy selection, and
+calibration constants are exposed as environment variables rather than
+requiring source edits.
+
 \subsection{Calibration Discipline}
 
 \begin{table}[h]
-\caption{Measured (not guessed) system constants}
+\caption{Calibrated settings and documented experimental exceptions}
 \label{tab:calibration}
 \centering
-\begin{tabular}{@{}p{0.32\linewidth}p{0.22\linewidth}p{0.34\linewidth}@{}}
+\begin{tabular}{@{}p{0.29\linewidth}p{0.22\linewidth}p{0.37\linewidth}@{}}
 \toprule
 \textbf{Constant} & \textbf{Value} & \textbf{Measured via} \\
 \midrule
 \texttt{LOAD\_REF} & 16 concurrent requests & Kleinrock power (throughput/latency) peak, single-worker concurrency sweep, Qwen2.5-7B, $\sim$1700-token prompts \\
-\texttt{AVG\_PROMPT\_TOKENS\_} \texttt{ESTIMATE} & 2{,}392 tokens & Mean prompt token count, $n{=}800$ live RAG requests, top-$k{=}10$ \\
-DualMap SLO / rebalance thresholds & 38{,}272 / 57{,}408 tokens & \texttt{LOAD\_REF} $\times$ mean prompt tokens; 1.5$\times$ ratio preserved from DualMap's own SLO/rebalance relationship \\
-\texttt{D\_TARGET} (drift detector reference) & 0.529 & Session-adjacent Jaccard overlap mean, $n{=}800$ live queries \\
-\texttt{TRACKER\_CAPACITY} & 5{,}840 blocks & Smaller of the two deployment machines' real KV-cache block capacity \\
+Mean prompt size & 2{,}392 tokens & Mean prompt token count, $n{=}800$ live RAG requests, top-$k{=}10$ \\
+DualMap-inspired SLO / rebalance thresholds & 38{,}272 / 57{,}408 tokens & \texttt{LOAD\_REF} $\times$ mean prompt tokens; 1.5$\times$ ratio preserved from DualMap's relationship \\
+\texttt{D\_TARGET} (drift reference) & 0.322 & Arrival-ordered within-session Jaccard stream, top-$k{=}10$, 2{,}170 stable observations \\
+\texttt{CUSUM\_H} & 0.30 & Grid calibration on nominal and drift-0.1 traces; 26.73 nominal alarms/1{,}000 and 2.20$\times$ separation \\
+\texttt{TRACKER\_CAPACITY} & 5{,}840 blocks calibrated; 50{,}000 in ordering/timing sweeps & Smaller worker's KV-cache capacity; sweep exception held constant across arms \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:calibration} lists every constant in the system that
-would otherwise have been a borrowed default (DualMap's own SLO
-thresholds are tuned to its authors' hardware, not ours) or an outright
-guess (an early version of the prompt-token estimate used 1{,}700,
-chosen by inspection rather than measurement). Section~VI-B reports the
-consequence of \emph{not} doing this for \texttt{TRACKER\_CAPACITY}: a
-core ablation's conclusion inverted once the constant was corrected.
+Table~\ref{tab:calibration} separates calibrated values from a deliberate
+experimental exception. Semantic top-$k$, centroid learning rate,
+CUSUM margin $K$, EWMA rate, and \texttt{protect\_top\_k} retain explicit
+prototype defaults. The source default for \texttt{TRACKER\_CAPACITY}
+is 50{,}000; calibrated routing experiments require
+\texttt{ROUTER\_TRACKER\_CAPACITY=5840}. The new ordering and timing
+sweeps were instead run at 50{,}000 in every arm. This does not vary
+within either comparison, but it can affect absolute cache-hit and
+tracker-accuracy values and is therefore not hidden as a calibrated
+setting. Section~VI-B shows why the distinction matters.
 
 \subsection{Overlap Characterisation Tool}
 
@@ -610,41 +671,74 @@ ground truth, read from
 \texttt{usage.prompt\_tokens\_details.cached\_tokens} in the streamed
 response, rather than assuming the two agree.
 
+For the two-step path, the current replay harness records
+\texttt{sent\_s} before \texttt{/router/decide\_order} but starts its
+TTFT and total-duration clock only immediately before the completion
+request. The reported two-step TTFT therefore excludes decision,
+reordering, and the first HTTP round trip. It validates completion-path
+behaviour but is not an end-to-end latency directly comparable with a
+one-phase strategy.
+
+The replicated ordering and bookkeeping ablations use
+\texttt{trace\_hot.jsonl} (Zipf $s{=}1.5$, session length four), 300
+requests, top-$k{=}10$, the Hugging Face tokenizer, and a fixed
+\texttt{cache\_aware} routing strategy. Before every arm, both vLLM
+engines are restarted to clear their persistent prefix caches and the
+router is restarted to clear \texttt{PrefixTracker}. Arms are
+interleaved repeat-major and their order is rotated between three
+repetitions, limiting slow hardware drift from favouring one policy.
+The replay schedule is verified independently: across all 12 timing
+runs, schedule-lag p99 is at most 6\,ms, below the 1\,s rejection
+threshold. Ordering changes only chunk order and retains one request
+round trip; the router, join delimiter, prompt template, and request
+schedule remain fixed.
+
 \subsection{Evaluation Metrics}
 
-The overlap$\times$load sweep matrix described as future work
-(Section~VIII, item~1) is designed to score every cell on five
-metrics:
+The planned system comparison and its load/locality extensions
+(Section~IX, items~1--2) are designed to report five metrics:
 
 \begin{itemize}
-  \item \textbf{TTFT (Time to First Token).} The direct indicator of
-  prefill cost -- time from request arrival to the first generated
-  token. Reported at p50 (typical behaviour) and p95 (tail behaviour)
-  separately, since a policy can improve one while worsening the
-  other.
-  \item \textbf{Throughput / goodput.} The peak sustainable request
-  rate (req/s) under a fixed TTFT SLO (e.g.\ $<$5\,s), rather than raw
-  throughput alone, so that a policy cannot trade tail latency for a
-  throughput number that would not actually be usable.
+  \item \textbf{TTFT (Time to First Token).} For one-phase runs, time
+  from request dispatch to the first generated token, reported at p50
+  and p95. The current two-step measurement is completion-phase TTFT;
+  an end-to-end timer remains to be added before cross-path comparison.
+  \item \textbf{Throughput / goodput.} The current sweep scorer computes
+  raw observed throughput. SLO goodput (e.g.\ requests with TTFT
+  $<$5\,s per second) is the intended metric but is not implemented yet.
   \item \textbf{Cache reuse (token-weighted).} The fraction of prompt
-  tokens served from cache rather than recomputed. Measured in
-  \emph{tokens}, not chunk count -- Section~III-C.1 shows why
-  chunk-count accounting can pick the wrong worker when chunk lengths
-  vary, which they do substantially in this corpus (Section~IV-A).
+  tokens served from cache rather than recomputed, taken from vLLM's
+  response accounting. This engine metric is token-based even though
+  live \texttt{per\_worker\_tree} worker scoring is still chunk-based.
+  The current ordering scorer macro-averages this fraction across
+  requests; it is therefore not identical to aggregating cached and
+  prompt token counts over the full run.
   \item \textbf{Load balance (CV).} The coefficient of variation of
   request counts across workers; lower means a more even split.
-  \item \textbf{Answer quality (Exact Match / token-F1).} Reordering
-  changes prompt order but not content, and CacheWeaver's own
-  evaluation (Table~7) found no measurable quality loss from
-  reordering in their setting -- but, as noted in Section~III-C.2,
-  that is not a universal guarantee. This metric compares
-  retrieval-order and reordered outputs on the identical question set
-  to check whether that guarantee holds here; until it is measured,
-  ``reordering preserves quality'' should be read as an inherited
-  assumption, not a result of this paper (Section~VII, Section~VIII).
+  \item \textbf{Answer quality.} Because TQuAD answers are short spans
+  while the model commonly returns a sentence, the primary metric is
+  whether the normalised model output contains the gold span. Token
+  recall, token-F1, and exact match are retained as secondary metrics.
+  The replicated ordering sweep reports mean and sample standard
+  deviation; differences smaller than twice the largest within-arm
+  standard deviation are treated as unresolved.
 \end{itemize}
 
+The dry-run sweep scorer also needs correction before live use: it
+averages per-request cache fractions rather than aggregating token
+counts, and currently reports load CV as zero when all traffic reaches
+one worker because absent workers are omitted. These are implementation
+gaps, not completed metric results.
+
 \section{Results}
+
+\textbf{Artifact status.} The repository includes the overlap scores,
+trace manifests, experiment drivers, calibration tools, regression
+tests, and a configuration-recording sweep harness. It does not retain
+the raw live-run JSONL outputs underlying the numerical live tables.
+Those values are preserved in the project log and final report but
+cannot be recomputed from the submitted tree without rerunning the two
+vLLM workers.
 
 \subsection{Overlap Characterisation}
 
@@ -665,14 +759,14 @@ stumbling onto a hit even without session affinity. Popularity drift
 has the opposite, and faster-saturating, effect: turning drift on at
 all (rate 0.1) drops session-adjacent overlap from 0.476 to 0.383
 and global-adjacent overlap from 0.055 to 0.030, with almost no
-further degradation from 0.1 to 0.5 -- direct evidence for why a
-\emph{static} locality-based policy should be expected to degrade under
-drift while an adaptive one should not.
+further degradation from 0.1 to 0.5. This motivates testing adaptation
+under drift; it is not itself evidence that either adaptive mode
+improves live routing.
 
 \subsection{Calibration Reverses an Ablation}
 
 \begin{table}[h]
-\caption{Cache-aware ($\beta{=}1$) vs. load-blind ($\beta{=}0$), before and after \texttt{TRACKER\_CAPACITY} recalibration}
+\caption{Calibrated cache-aware ($\beta{=}1$) vs. load-blind ($\beta{=}0$)}
 \label{tab:crossover}
 \centering
 \begin{tabular}{@{}lccc@{}}
@@ -692,12 +786,10 @@ real capacity. Under that assumption, $\beta{=}0$ appeared to win at
 30$\times$ load; after recalibrating capacity to the smaller machine's
 real value (5{,}840 blocks) and rerunning under an identical protocol
 (cold restart before every arm), the winner at 30$\times$ flips to
-$\beta{=}1$ (Table~\ref{tab:crossover}). The direction change is not
-noise: it survives across the two load levels tested and across a
-second, independently generated trace with different locality
-characteristics (Section~VI-D). The finding this points to is that an
-uncalibrated capacity constant is not merely a source of quantitative
-error -- it can invert which policy an ablation recommends.
+$\beta{=}1$ (Table~\ref{tab:crossover}). No pre-calibration value for
+35$\times$ is retained in the current report, so the demonstrated
+reversal is specifically the 30$\times$ result. It still shows that an
+uncalibrated capacity constant can invert an ablation's recommendation.
 
 A secondary, still-open observation from the same experiments: worker
 split is consistently asymmetric in a strategy-dependent, load-independent
@@ -712,9 +804,10 @@ genuine, unmeasured asymmetry between the two physical machines
 \subsection{\texttt{cacheweaver\_dualmap} vs.\ \texttt{cache\_aware}}
 
 \begin{table}[h]
-\caption{Three-run repeat comparison, calibrated thresholds}
+\caption{Historical three-run comparison of current strategy labels}
 \label{tab:dualmap-vs-cacheaware}
 \centering
+\resizebox{\columnwidth}{!}{%
 \begin{tabular}{@{}lccc@{}}
 \toprule
 \textbf{Strategy} & \textbf{TTFT p50 (3 runs)} & \textbf{Mean} & \textbf{Hit rate} \\
@@ -722,20 +815,22 @@ genuine, unmeasured asymmetry between the two physical machines
 \texttt{cache\_aware} & 0.272 / 0.346 / 0.318\,s & 0.312\,s & 66.0--66.6\% \\
 \texttt{cacheweaver\_} \texttt{dualmap} & 0.314 / 0.309 / 0.363\,s & 0.329\,s & 66.5--66.7\% \\
 \bottomrule
-\end{tabular}
+\end{tabular}%
+}
 \end{table}
 
-A single earlier run had suggested a 56\% TTFT advantage for
+A single earlier $n{=}1$ run had suggested a 56\% TTFT advantage for
 \texttt{cache\_aware}; repeating the comparison three times under
 calibrated thresholds narrows the gap to 5.5\%, with overlapping
-variance across runs -- the original difference was substantially
-measurement noise from an $n{=}1$ comparison, not a real effect. A
-second, independent difference does survive repetition, however:
+run-to-run variation. A stable worker-split difference also appears:
 \texttt{cacheweaver\_dualmap}'s worker split locks to a near-identical
 ratio across all three runs ($\sim$538/262 each time), while
 \texttt{cache\_aware}'s split varies considerably run to run
-(282/518, 293/507, 349/451). Section~VI-F identifies the mechanism
-behind this stability.
+(282/518, 293/507, 349/451). These numbers compare the implemented
+strategy labels only: Section~III-D shows that the former did not apply
+its computed order to vLLM and may not have exercised its load/SLO
+branch. Section~VI-F identifies a candidate-tie bias as one plausible
+contributor, not a complete causal explanation.
 
 \subsection{Sensitivity Analysis}
 
@@ -757,11 +852,11 @@ Low locality  & 35$\times$ & 2.018\,s & 4.370\,s & $\beta{=}1$ (+54\%) \\
 
 Repeating the crossover comparison on a second trace with markedly
 lower repeat rate (68.8\% vs.\ 91.9\% for the original) produces four
-data points with four different winners and magnitudes
+outcomes in which each policy wins twice
 (Table~\ref{tab:sensitivity}). The clearest pattern is at the highest
 load tested (35$\times$): the gap between policies grows substantially
-on both traces, but in \emph{opposite} directions (a 12-point win for
-one policy on one trace, a 54-point win for the other policy on the
+on both traces, but in \emph{opposite} directions (a 12\% win for one
+policy on one trace and a 54\% win for the other policy on the
 other). A claim of the form "policy $X$ wins at high load" is therefore
 underspecified without also stating which workload locality regime it
 was measured under -- the benefit of the cache-affinity term is a joint
@@ -770,15 +865,19 @@ function of load \emph{and} locality, not load alone.
 \subsection{Dispatch-Time vs.\ Completion-Time Bookkeeping}
 
 \begin{table}[h]
-\caption{Router-believed vs.\ engine-truth cache-hit tokens}
+\caption{Replicated cache-state accuracy at two replay loads (three runs per mode)}
 \label{tab:timing}
 \centering
-\begin{tabular}{@{}lccc@{}}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{@{}llccc@{}}
 \toprule
-\textbf{Recording point} & \textbf{Correlation} & \textbf{Bias} & \textbf{Underestimate rate} \\
+\textbf{Spd.} & \textbf{Mode} & \textbf{Corr.} & \textbf{Rank agree.} & \textbf{Underest.} \\
 \midrule
-Dispatch & 0.932 & $-13.6$ & 2.4\% \\
-Completion & 0.749 & $-75.8$ & 14.0\% \\
+$5\times$ & Dispatch & $0.972{\pm}0.010$ & $97.1{\pm}0.6\%$ & $0.0{\pm}0.0\%$ \\
+$5\times$ & Completion & $0.941{\pm}0.011$ & $92.5{\pm}0.6\%$ & $6.2{\pm}0.7\%$ \\
+$15\times$ & Dispatch & $0.980{\pm}0.003$ & $98.0{\pm}0.0\%$ & $0.0{\pm}0.0\%$ \\
+$15\times$ & Completion & $0.806{\pm}0.008$ & $79.7{\pm}0.9\%$ & $29.6{\pm}0.8\%$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -787,19 +886,34 @@ Recording a block as cached at the moment a request is \emph{dispatched}
 is, in principle, optimistic -- prefill has not actually happened yet,
 so the belief could be wrong if the request later fails. Recording at
 \emph{completion} is, in principle, conservative and therefore expected
-to be more accurate. Under identical trace, load, and calibration
-conditions, the opposite is observed (Table~\ref{tab:timing}):
-completion-time recording is both less correlated with engine ground
-truth and substantially more biased toward underestimating real cache
-hits. At high concurrency, completion-time bookkeeping misses the
-contribution of sibling requests that were dispatched to the same
-prefix but have not yet finished by the time a new request needs to
-know what is cached -- a systematic underestimate that dispatch-time
-recording, by construction, cannot produce. Much of what an earlier,
-uncalibrated comparison had attributed to "dispatch-time optimism" is
-better explained as uncalibrated capacity (Section~VI-B); once capacity
-is corrected, dispatch-time recording is the more accurate choice in
-this regime.
+to be more accurate. The routing-relevant correlation and rank metrics
+show the opposite and, more importantly, expose a load interaction
+(Table~\ref{tab:timing}). When replay speedup increases from five to
+fifteen, dispatch correlation remains near 0.98 with zero observed
+underestimation, while completion correlation falls from 0.941 to 0.806
+and its rank concordance falls from 92.5\% to 79.7\%. Its underestimate
+rate simultaneously rises from 6.2\% to 29.6\%. The correlation gap
+consequently expands from 0.031 to 0.174. Completion has the smaller
+absolute bias at speedup five, so the evidence does not support the
+stronger claim that dispatch is closer on every error metric. The mean
+biases (tokens) at speedups five and fifteen are respectively
+$+31.3{\pm}9.2$ and $+23.7{\pm}1.0$ for dispatch, versus
+$-5.2{\pm}20.3$ and $-170.3{\pm}25.5$ for completion.
+
+The proposed mechanism is that completion-time bookkeeping cannot yet
+see sibling requests dispatched to the same prefix but still in flight
+when a new request arrives, and their number increases with
+concurrency. Dispatch-time recording sees them immediately, although it
+can overestimate if a dispatched prefill later fails. The asymmetric
+load response and positive dispatch bias in all six new runs are
+consistent with this explanation but do not isolate it as the only
+cause. This load-dependent result supersedes the earlier single-run
+table, whose load condition was not recorded and whose negative
+dispatch-bias sign was not reproduced under the new protocol. Because
+these sweeps held the uncalibrated 50{,}000-block
+tracker capacity fixed across modes, the comparison supports the
+mechanism and relative ranking, not an absolute error claim for a
+calibrated deployment.
 
 \subsection{A Tie-Break Defect and Its Fix}
 
@@ -810,19 +924,15 @@ per-replica trees are frequently equally cold or equally warm --
 the hash-assigned first candidate won unconditionally. We replaced both
 non-strict comparisons in the selection path with an explicit,
 uniformly random tie-break, matching the convention already used
-elsewhere in the codebase. A statistical fairness test constructs
-400 requests engineered to tie (fresh, never-before-seen chunk sets
-against two empty per-replica trees) and records the resulting
-worker-selection distribution: the corrected code splits 197/203
-(49.2\%/50.8\%); the unmodified code is deterministic and would have
-produced 400/0 on the same input. This is the most likely explanation
-for the near-constant worker-split ratio observed across repeated
-\texttt{cacheweaver\_dualmap} runs in Section~VI-C; confirming that the
-fix changes the \emph{live}, GPU-measured split (rather than only the
-synthetic fairness test) is listed as immediate future work
-(Section~VIII).
+elsewhere in the codebase. A GPU-free regression test constructs 400
+equal-cost requests and checks that neither physical worker receives
+less than 35\% of them; unseeded reruns are approximately even. The old
+code selected the hash-assigned $r_1$ candidate on every tie, but this
+does \emph{not} imply a 400/0 physical-worker split because the identity
+of $r_1$ varies with the hash key. Whether the fix changes the live
+split remains unmeasured.
 
-\subsection{Token-Weighted Cache Gain}
+\subsection{Synthetic Token-Weighting Validation}
 
 On a synthetic scenario constructed so that one worker's cache holds
 two large chunks (combined $\approx$1{,}300 tokens) and a second
@@ -831,24 +941,24 @@ count-based cache-gain accounting selects the three-small-chunk worker
 (3 matched chunks beats 2), while token-weighted accounting selects the
 two-large-chunk worker (hit\_tokens/total\_tokens $\approx$0.99 vs.\
 $\approx$0.01) -- the two accounting schemes disagree on this input by
-construction, and only the token-weighted result reflects the real
-prefill saving available. This effect is measured, not merely
-theoretical: chunk lengths in the deployed corpus vary by up to two
-orders of magnitude (Section~IV-A).
+construction, and the token-weighted result better represents potential
+prefill saving. This validates the optional module path only; the live
+endpoint does not supply the required chunk texts (Section~III-C.1).
 
-\subsection{Live Validation: Semantic Pre-Filter}
+\subsection{Embedding-Model Warm-Up Observation}
 
-Run against live two-worker traffic (300 requests, 0 failures), the
-semantic pre-filter's only measured cost was a one-time
+During a 300-request two-worker run (0 failures), the semantic strategy
+incurred a one-time
 $\sim$5--6\,second embedding-model load that, before a start-up warm-up
 call was added, landed on whichever live request happened to arrive
 first after a router restart. Forcing this load synchronously at
 start-up (verified by measuring the warm-up call's own duration
 directly against the duration of the first \texttt{predict\_candidates}
-call immediately following it) removes the cost from the request path
-entirely.
+call immediately following it) moves the cost out of the request path.
+This run did not validate semantic filtering: the two-phase endpoint
+omitted query text and top-$k$ equalled the two-worker pool.
 
-\subsection{Live Validation: \texttt{per\_worker\_tree}}
+\subsection{Live Protocol Validation: \texttt{per\_worker\_tree}}
 
 The two-phase decide-order protocol was validated against live
 two-worker traffic for the first time in this round of experiments
@@ -857,138 +967,270 @@ candidate comparison is possible). Across 300 requests: 0 failures,
 100\% of completions correctly forced to the worker chosen by
 \texttt{/router/decide\_order} (\texttt{reason=forced\_by\_decide\_order}
 on every request), and real, non-degenerate traffic splitting
-(130/170) confirming the joint worker-and-order decision is actually
-exercising both replicas rather than collapsing to one.
+(130/170). This validates worker forcing and client-applied ordering
+across both replicas. The split is not a cache-efficiency or latency
+comparison against global greedy. No matched baseline was collected for
+cache reuse, end-to-end latency, or answer quality. Moreover, the run
+does not include phase-one latency in TTFT and uses chunk-count rather
+than token-weighted worker scoring; it is consequently a
+protocol-correctness result only.
+
+\subsection{Worker-Blind Cache-Informed Ordering Ablation}
+
+All four arms below use the same \texttt{cache\_aware} router and vary
+only prompt order; none uses \texttt{per\_worker\_tree}. In particular,
+the greedy arm maintains one global estimated history tree and does not
+associate a cached prefix with a particular replica.
+
+\begin{table}[h]
+\caption{Ordering ablation at top-$k{=}10$ (mean $\pm$ sample standard deviation, three runs per arm)}
+\label{tab:ordering}
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Order} & \textbf{Mean cached fraction} & \textbf{TTFT p50} & \textbf{Contains gold} \\
+\midrule
+Greedy & $73.1{\pm}0.2\%$ & $0.088{\pm}0.006$\,s & $79.6{\pm}0.4\%$ \\
+Relevance & $67.7{\pm}0.1\%$ & $0.111{\pm}0.025$\,s & $79.9{\pm}0.4\%$ \\
+Canonical & $65.0{\pm}0.5\%$ & $0.122{\pm}0.015$\,s & $77.8{\pm}0.2\%$ \\
+\texttt{pinned\_prefix} & $62.9{\pm}0.2\%$ & $0.161{\pm}0.012$\,s & $79.7{\pm}0.3\%$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+At top-$k{=}3$, a preliminary single run produces only a 2.4 percentage
+point spread in mean cached fraction (79.1\% canonical, 78.7\% relevance,
+81.1\% greedy), so the ordering lever is too narrow to separate the
+arms. At top-$k{=}10$, twelve interleaved runs yield the clear ranking in
+Table~\ref{tab:ordering}. Relative to canonical sorting, the global
+CacheWeaver-style greedy tree raises the mean per-request cached-token
+fraction by 8.1 percentage
+points and reduces median TTFT by 27.9\%. Its primary quality score is
+not separated from relevance order by the prespecified spread rule
+(79.6\% vs.\ 79.9\%). Greedy changes the order on 43.3\%
+of requests, with a mean reported reorder depth of 7.17 out of ten.
+
+The negative \texttt{pinned\_prefix} result helps identify the relevant
+mechanism. It places chunks repeated from the previous turn of the same
+session first, then preserves relevance order for the tail. It engages
+on 57.0\% of requests, matching the 57.15\% predicted from trace session
+structure, yet finishes last on cache reuse. At top-$k{=}10$, it pins an
+average of only 3.38 chunks and never pins all ten. Its contains-gold
+score is not separated from relevance order under the prespecified spread
+rule, and its cache result is consistent with the hypothesis that it
+disrupts cross-session prefix consistency already supplied by the retriever;
+the experiment does not directly measure that causal pathway.
+Taken together, these four arms do not show that arbitrary reordering
+helps: both cache-oblivious imposed orders underperform the untouched
+relevance order, and only the cache-history-informed greedy policy
+improves it. This conclusion is limited to the stated trace, retrieval
+depth, and uncalibrated tracker-capacity setting.
+
+The proposed \texttt{per\_worker\_tree} scheme is absent from
+Table~\ref{tab:ordering}. The four displayed arms isolate prompt order
+under a fixed \texttt{cache\_aware} router and a one-phase timer;
+\texttt{per\_worker\_tree} jointly changes both worker selection and
+order through a two-phase path. It cannot be treated as an unqualified
+fifth pure-order arm. Nevertheless, this missing system-level comparison
+leaves the central incremental hypothesis unanswered: whether per-replica
+trees improve upon the 73.1\% global worker-blind greedy baseline. The
+130/170 live run above validates mechanics, not superiority. A controlled
+comparison requires arm-specific router configuration, identical cold
+starts and traces, and end-to-end timing of both protocol phases.
+
+\subsection{Trace-Driven CUSUM Calibration}
+
+\begin{table}[h]
+\caption{CUSUM threshold calibration at top-$k{=}10$}
+\label{tab:cusum}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{$H$} & \textbf{Nominal alarms/1{,}000} & \textbf{Drift/nominal alarm ratio} \\
+\midrule
+0.20 (previous) & 108.76 & $1.52\times$ \\
+0.30 (selected) & 26.73 & $2.20\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The detector was calibrated without GPU inference because its input is
+a deterministic function of the retrieved chunk sets. The calibration
+replays the router's actual arrival-ordered, within-session Jaccard
+stream rather than grouping observations by session: 2{,}170 stable
+observations from \texttt{trace.jsonl} and 2{,}139 from an otherwise
+matched drift-0.1 trace. Retrieval depth changes the stream materially.
+The measured stable reference is 0.478 at top-$k{=}3$ but 0.322 at the
+top-$k{=}10$ setting used by the live experiments, invalidating the
+previous 0.529 default.
+
+With $\lambda{=}0.1$ and $K{=}0.03$, increasing $H$ from 0.20 to 0.30
+reduces nominal-trace alarms fourfold while improving separation
+(Table~\ref{tab:cusum}). Even after calibration, however, 2.20$\times$
+separation costs alarms on 2.7\% of nominal observations; because the
+nominal trace has no labelled change points, these are treated as a
+conservative false-alarm proxy rather than ground-truth false positives.
+Stricter budgets leave
+too few alarms for a strong claim. Feeding the smoothed EWMA rather than
+raw Jaccard nearly silences both streams and does not improve
+discrimination. CUSUM therefore remains diagnostic telemetry, not an
+empirically validated routing control signal.
 
 \section{Discussion and Limitations}
 
-The results in Section~VI support a general claim about this class of
-system: \emph{the largest source of measurement error in a cache-aware
-routing ablation is often not the routing algorithm at all, but an
-uncalibrated constant the algorithm depends on.} \texttt{TRACKER\_CAPACITY}
-reversed a head-to-head comparison's conclusion; the dispatch-vs-completion
-timing result largely dissolved once capacity was corrected; and an
-$n{=}1$ comparison between two genuinely competitive policies
-overstated a 56\% gap that repetition narrowed to 5.5\%. None of these
-findings required a new algorithm -- they required measuring
-quantities the system was already implicitly assuming.
+The most defensible conclusion is narrower than ``one router wins.''
+Calibration and measurement protocol can change the apparent result:
+the 30$\times$ tracker-capacity correction reversed a policy comparison,
+an $n{=}1$ comparison overstated a gap later narrowed by repetition, and
+the replicated bookkeeping sweep showed a load-dependent failure of
+completion-time tracking. The ordering ablation similarly supports a
+conditional conclusion: at top-$k{=}10$, only the history-informed
+global greedy tree improves on relevance order; canonical and
+session-prefix rules do not. These results favour cache-informed
+ordering, not reordering in general. The committed overlap data and
+experiment code are reproducible; the numerical live tables require
+their missing raw outputs before they can be independently verified.
 
-Two open items remain unresolved by this work. First, the
-\texttt{cache\_aware} crossover experiments' worker-split asymmetry
-(Section~VI-B) has no code-level explanation as clean as the tie-break
-defect that explains \texttt{cacheweaver\_dualmap}'s; ruling in or out
-a physical asymmetry between the two deployment machines requires
-infrastructure-level measurement (per-machine latency and GPU clock
-state) outside this paper's scope. Second, the semantic pre-filter's
-live integration is incomplete by design: the two-phase protocol does
-not yet carry query text, so the filter is validated end-to-end only
-when driven with query text directly, not through the live HTTP path.
-Both are listed as future work below rather than claimed as solved.
-
-Scope was also deliberately bounded at several points during
-development -- an EWMA/CUSUM adaptive mechanism was first built and
-validated as a self-contained, disconnected module before a later,
-explicit decision to wire it into two independent call sites
-(\texttt{adaptive\_cache\_aware} and \texttt{per\_worker\_tree}'s
-\texttt{ewma\_cusum} mode) as one of two ablation arms rather than as a
-silent default. We note this because a system with this many
-independently toggleable mechanisms is easy to over-claim about; every
-mechanism in this paper defaults to its baseline behaviour and was
-verified, via unit test, to reproduce that baseline byte-for-byte when
-disabled.
+The implementation audit also separates completed paths from
+prototypes. Base worker-specific ordering is client-applied and was
+exercised across both workers, but its timer omits phase one and its
+scoring is chunk-count-based. Most importantly, it has not been compared
+against the global greedy arm on cache reuse or end-to-end latency;
+therefore the paper does not yet establish the incremental performance
+benefit of worker-specific trees. Semantic pruning, token-weighted scoring,
+CUSUM-driven policy changes, and a controlled adaptive comparison are
+not live results. CUSUM's alarm threshold is now trace-calibrated, but
+alarms still do not affect the routing weights. The DualMap-inspired arm
+neither applies its computed order to vLLM nor proves that its load/SLO
+branch activates. These are material scope boundaries, not minor
+engineering details.
 
 \subsection{Additional Threats to Validity}
 
-Beyond the two open items above, five further limitations are stated
-plainly rather than left implicit:
+The remaining threats to validity are:
 
 \begin{enumerate}
-  \item \textbf{Two-worker deployment and DualMap's degeneracy.} All
-  live experiments run on two replicas (a hardware constraint). This
-  is not an incidental limitation for the \texttt{cacheweaver\_dualmap}
-  baseline specifically: Section~III-C shows its dual-hash candidate
-  selection is provably a no-op at $n{=}2$, meaning this evaluation
-  cannot exercise DualMap's own headline advantage (choosing 2 good
-  candidates out of $n{>}2$) at all -- only the SLO-aware/rebalancing
-  layer on top of an already-fixed candidate pair is actually being
-  tested. Scaling this comparison to $n{>}2$ replicas is future work,
-  not something this paper's results speak to.
+  \item \textbf{Missing central performance comparison.} The pure
+  ordering sweep holds \texttt{cache\_aware} routing fixed, whereas
+  \texttt{per\_worker\_tree} jointly selects a replica and an order.
+  The two-worker run verifies that this protocol executes correctly but
+  does not compare it with the global, worker-blind greedy tree. The paths
+  also use different prompt separators and timing boundaries. A valid
+  system-level comparison requires matched prompt serialisation, a timer
+  starting before \texttt{/router/decide\_order}, and identical cold-start,
+  capacity, trace, and load conditions. Until then, the central
+  worker-specific performance hypothesis is unresolved.
+  \item \textbf{Two workers and a partial baseline.} At $n{=}2$, both
+  hash candidates cover the whole pool. The local DualMap-inspired
+  strategy also differs from the published system in mapping,
+  migration, cost estimation, and load instrumentation. It must not be
+  interpreted as an evaluation of official DualMap.
   \item \textbf{Synthetic traffic.} The overlap characterisation
   (Section~VI-A) and every live experiment use a synthetic trace
   (popularity-skewed, session-structured) generated over the real
   TQuAD corpus, not captured production traffic. Absolute values
-  (overlap magnitudes, TTFT numbers) should be expected to shift under
-  real traffic; the qualitative trends this paper argues from
-  (session-adjacent vs.\ global-adjacent gap, skew and drift effects)
-  are the parts expected to transfer.
-  \item \textbf{Tokenizer mode.} \texttt{prefix\_tracker.py} supports
-  both an exact HuggingFace tokenizer and a cheap character-bucket
-  approximation (\texttt{ROUTER\_TOKENIZER=approx}, the default, kept
-  for dependency-free smoke tests). Every number reported in Section~VI
-  was collected with the exact tokenizer; reusing this system for
-  further measurement should confirm that mode explicitly rather than
-  inherit the approximate default silently.
-  \item \textbf{Answer-quality validation is not yet performed.} As
-  stated in Section~V-B's metric definitions, the claim that reordering
-  preserves answer quality is inherited from CacheWeaver's own
-  evaluation, not independently confirmed on this corpus; Section~VIII
-  lists this as the most consequential remaining validation step before
-  any reordering mechanism here should be trusted beyond a research
-  setting.
-  \item \textbf{Extended components are prototype-calibrated, not
-  traffic-calibrated.} The semantic pre-filter and the EWMA/CUSUM
-  mechanism are both verified by self-test (Sections~III-E, III-F) and,
-  for the semantic filter, by live traffic (Section~VI-H) -- but their
-  tunable parameters (\texttt{SEMANTIC\_TOP\_K}, the EWMA rate
-  $\lambda$, and the CUSUM margin/threshold $k,h$) were set to
-  reasonable defaults, not measured against real production traffic the
-  way \texttt{LOAD\_REF} or \texttt{AVG\_PROMPT\_TOKENS\_ESTIMATE} were
-  (Table~\ref{tab:calibration}). They are presented as extended
-  evaluation components on top of the paper's main contribution, not as
-  part of its central, calibrated claims.
+  (overlap magnitudes and TTFT) may shift under production traffic. The
+  replicated ordering result additionally covers one hot trace, 300
+  requests, and top-$k{=}10$; top-$k{=}3$ produced only a preliminary
+  null result.
+  \item \textbf{Capacity and aggregation.} The new ordering and timing
+  sweeps held \texttt{TRACKER\_CAPACITY=50000} fixed, not the calibrated
+  5{,}840-block value. Constancy removes a direct arm-level change but
+  does not rule out a capacity-by-policy interaction. Their cache metric
+  is also a macro-average of per-request fractions rather than a
+  run-level cached-token aggregate.
+  \item \textbf{Run reproducibility.} The repository lacks raw live
+  JSONL outputs and a complete hardware/driver manifest. The new sweep
+  scripts record configuration, arm order, and schedule lag, and trace
+  manifests record generation parameters, but numerical tables still
+  require a fresh deployment run. Defaults also differ from some
+  reported settings: tokenizer mode is approximate and tracker capacity
+  is 50{,}000 unless overridden.
+  \item \textbf{Two-step accounting.} Current TTFT excludes the
+  decision round trip, and phase-one tree insertion can survive a failed
+  phase-two request. Cross-strategy latency and cache-state correctness
+  need an end-to-end, failure-aware protocol.
+  \item \textbf{Prototype calibration.} Semantic top-$k$ and
+  quality-protection parameters remain defaults. The CUSUM calibration
+  uses one synthetic drift strength, and the per-worker adaptive path
+  compares global adjacency against a within-session target; alarms do
+  not affect routing.
+  \item \textbf{Answer quality.} The new quality result validates the
+  global, worker-blind greedy arm under one TQuAD trace and the
+  contains-gold metric. It does not validate worker-specific greedy
+  reordering or \texttt{protect\_top\_k}; paired significance tests and a
+  cache-prefix continuity check remain necessary before deployment.
 \end{enumerate}
+
+\section{Artifact Availability and Team Contributions}
+
+The complete source repository is available at
+\url{https://github.com/ubbx05/cache-aware-llm-router}. The submission
+archive contains the router, all routing strategies, replay and
+calibration scripts, smoke tests, monitoring configuration,
+\texttt{SETUP.md}, dependency specification, and the \LaTeX{} source and
+PDF of this paper; generated corpora, embeddings, traces, and live-run
+outputs are excluded. The raw TQuAD source is publicly available at
+\url{https://github.com/TQuad/turkish-nlp-qa-dataset}, and
+\texttt{bench/build\_corpus.py} documents the deterministic text
+chunking and block-alignment transformation. Data fingerprints and
+trace manifests are supplied so an independently obtained copy can be
+checked against the experimental inputs.
+
+Repository history reflects the following primary division of work.
+Umut Baran Boztaş developed the core proxy and replay pipeline, the
+per-worker/two-phase integration, and live deployment calibration.
+Saadet Cansu Baktıroğlu developed cache-measurement and adaptive,
+semantic, token-weighted, and quality-protection extensions and led the
+IEEE paper synthesis. Demir Doruk Dilek developed the replicated
+ordering and bookkeeping ablations, CUSUM calibration, schedule checks,
+and reproducibility documentation. All authors reviewed the integrated
+system, experimental interpretation, and final artifact.
 
 \section{Conclusion and Future Work}
 
-We presented a cache-aware router for RAG-based LLM serving with seven
-interchangeable strategies, a worker-independent reordering design that
-avoids a proven degeneracy in dual-hash candidate selection at small
-replica counts, two independently ablatable overlap-adaptive weighting
-mechanisms sharing a common input signal, a semantic pre-retrieval
-candidate filter, and a calibration discipline applied to every
-constant the system depends on. The calibration discipline itself
-produced the paper's most consequential finding: an uncalibrated
-constant inverted a core ablation's conclusion, and correcting it also
-resolved a separate, seemingly unrelated result about cache-bookkeeping
-timing.
+This project implements and functionally validates a live,
+worker-specific two-step routing-and-ordering path on two replicas.
+Separately, at top-$k{=}10$, an order-only ablation under fixed routing
+finds that a global cache-history-informed greedy order raises the mean
+per-request cached-token fraction by 8.1 percentage points and lowers
+completion-path median TTFT by 27.9\% relative to canonical order. Its
+primary contains-gold score is not separated from relevance order under
+the prespecified spread rule. These results do not establish an incremental advantage
+from per-worker rather than global histories. The negative canonical and session-prefix results show
+that the benefit belongs to cache-informed ordering rather than
+reordering alone. Replicated tracker tests further show that
+completion-time bookkeeping degrades with concurrency while
+dispatch-time bookkeeping remains stable. Calibration and timing
+conventions therefore materially change routing conclusions.
 
-Future work falls into four categories. \textbf{(1) Completing the
-sweep matrix}: an overlap$\times$load$\times$strategy sweep runner
-(3 overlap levels $\times$ 3 load levels $\times$ 7 strategies, 63
-cells) is implemented and verified GPU-free via a dry-run mode, but has
-not yet been executed against live hardware. \textbf{(2) Closing the
-semantic pre-filter's live integration gap} by extending the two-phase
-protocol to carry query text. \textbf{(3) Resolving the open
-worker-split asymmetry} in \texttt{cache\_aware} through
-infrastructure-level measurement, and confirming that the tie-break fix
-of Section~VI-F changes the \emph{live}, GPU-measured
-\texttt{cacheweaver\_dualmap} split and not only the synthetic fairness
-test. \textbf{(4) Answer-quality evaluation}: every reordering
-mechanism in this paper (\texttt{protect\_top\_k} included) currently
-optimises for prefill latency under the assumption, inherited from
-CacheWeaver, that chunk order does not materially affect answer
-quality; measuring that assumption directly against this project's
-own TQuAD-derived gold answers is the natural next step before any of
-these mechanisms should be deployed beyond a research setting.
+Immediate work is therefore concrete. \textbf{(1)} Run the missing
+replicated system-level \texttt{per\_worker\_tree}-versus-global-greedy
+comparison at the calibrated 5{,}840-block capacity, with arm-specific
+router configuration, matched prompt serialisation, identical cold
+starts, and an end-to-end timer. Report cache reuse, TTFT p50/p95,
+answer quality, load CV, decision overhead, and failures; its joint
+design must be labelled separately from the pure-order arms.
+\textbf{(2)} Repeat at speedups 5 and 15 and on a second locality trace,
+aggregating cached token counts over each run.
+\textbf{(3)} Measure \texttt{protect\_top\_k} and extend the decision
+contract with query text and chunk token counts while making phase-one
+bookkeeping failure-aware. \textbf{(4)} Evaluate the DualMap-inspired
+arm and worker-specific ordering on an appropriate $n{>}2$ deployment.
+\textbf{(5)} Align adaptive modes on one overlap stream and either make
+calibrated CUSUM alarms an explicit control input or retain them strictly
+as telemetry. Raw runs, a complete environment manifest, paired quality
+tests, and prefix-continuity measurements must accompany those results.
 
-% ---------------------------------------------------------------------
-% TODO (team): the project's literature survey
-% (BIL401_literatur_taramasi.xlsx) covers 18 papers; 15 are cited here
-% (4 implemented against directly + 11 in the expanded Related Work
-% comparison). Add any of the remaining ~3 if they're relevant to your
-% final framing before submission.
-% ---------------------------------------------------------------------
+\IEEEtriggeratref{8}
 \begin{thebibliography}{00}
+
+\bibitem{tquad}
+TQuad, ``Turkish NLP Question Answering Dataset,'' SQuAD-format Turkish
+question-answering data, accessed Aug.\ 15, 2026.
+\url{https://github.com/TQuad/turkish-nlp-qa-dataset}.
 
 \bibitem{kwon2023vllm}
 W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez,
@@ -1014,8 +1256,9 @@ Code: \url{https://github.com/ASISys/DualMap}.
 A. Dhasade, R. Guerraoui, A.-M. Kermarrec, D. Petrescu, R. Pires,
 M. Randl, and M. de Vos, ``Efficient Federated Search for
 Retrieval-Augmented Generation Using Lightweight Routing,'' in
-\emph{Proc.\ 5th Workshop on Machine Learning and Systems
-(EuroMLSys)}, 2025. \url{https://arxiv.org/abs/2502.19280}.
+\emph{Proc.\ Distributed Applications and Interoperable Systems
+(DAIS)}, LNCS, vol.~16591, 2026, pp.~3--20.
+\url{https://doi.org/10.1007/978-3-032-27358-1_1}.
 
 \bibitem{preble2025}
 V. Srivatsa, Z. He, R. Abhyankar, D. Li, and Y. Zhang, ``Preble:

@@ -49,7 +49,8 @@ md5sum corpus/corpus.jsonl corpus/embeddings.npy corpus/qa.jsonl \
 ```
 
 **Hepsi tutuyorsa:** aynı veri setindesiniz, buradaki tüm ölçümlerle
-(paper'ın 0.476 session-adjacent'i, `D_TARGET=0.529`, top-k A/B'leri)
+(paper'ın 0.476 session-adjacent özeti ve top-k A/B'leri; canlı
+top-k=10 detektörü için `D_TARGET=0.322`)
 doğrudan karşılaştırılabilir. Devam et.
 
 **`trace*.jsonl` tutmuyor ama `corpus/` tutuyorsa:** başka parametrelerle
@@ -112,7 +113,7 @@ o ayrı bir ortam.
 
 ## 3. Kalibrasyon sabitleri — YENİ DONANIMDA YENİDEN ÖLÇÜLMELİ
 
-Paper'daki Tablo (Bölüm V-B) "measured, not guessed" diye beş sabit sayıyor.
+Paper'daki Tablo (Bölüm IV-C) "measured, not guessed" diye beş sabit sayıyor.
 Bunların hepsi **bu iki makinenin GPU'suna ve bu trace'e** ait. Yeni makinede
 körlemesine taşınırsa sayılar çıkar ama anlamsız olur.
 
@@ -120,7 +121,8 @@ körlemesine taşınırsa sayılar çıkar ama anlamsız olur.
 |---|---|---|
 | `ROUTER_TRACKER_CAPACITY` | **5840 blok** | vLLM'in açılış log'undaki KV cache boyutunu oku, 16'ya böl (BLOCK_SIZE), **iki makinenin küçüğünü** al |
 | `ROUTER_LOAD_REF` | 16 eşzamanlı istek | tek-worker concurrency sweep, throughput/latency (Kleinrock power) tepe noktası |
-| `ROUTER_D_TARGET` | 0.529 | `bench/overlap_measurement.py`, session-adjacent mean — trace değişmiyorsa **aynı kalır**, bu bir workload özelliği |
+| `ROUTER_D_TARGET` | 0.322 | Router'ın varış sıralı, aynı-session önceki istek Jaccard akışı, top-k=10 — trace **veya top-k** değişirse yeniden ölçülmeli |
+| `ROUTER_CUSUM_H` | 0.30 | `bench/calibrate_cusum.py`, nominal ve drift-0.1 trace ayrımı; alarm telemetrisi için, routing ağırlığını doğrudan değiştirmez |
 | DualMap SLO / rebalance | 38272 / 57408 token | `LOAD_REF × ortalama prompt token`; oran 1.5× sabit |
 
 ### `TRACKER_CAPACITY` neden bu listenin başında

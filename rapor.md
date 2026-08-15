@@ -4,9 +4,10 @@ Tier 1'in kalan altı maddesi (A, B, C, D, N, O) kapatıldı. Bu rapor ne
 yapıldığını, hangi sayıların nereden geldiğini ve bulguların paper'ın mevcut
 iddialarını nasıl değiştirdiğini kaydeder.
 
-**Özet:** Sıralama ablation'ı dört kola çıkarıldı ve `greedy`'nin kaliteden ödün
-vermeden %8 cache kazandırdığı 3× tekrarla gösterildi. Kendi önerimiz olan
-`pinned_prefix` başarısız oldu ve nedeni teşhis edildi. Dispatch-vs-completion
+**Özet:** Sıralama ablation'ı dört kola çıkarıldı ve `greedy`'nin canonical'a
+göre ortalama istek-başı cache oranını +8.1 yüzde puan artırdığı, ana kalite
+metriğinde relevance sırasından ayrışmadığı 3× tekrarla gösterildi. Kendi
+önerimiz olan `pinned_prefix` negatif sonuç verdi ve olası mekanizması tartışıldı. Dispatch-vs-completion
 bulgusunun yük ile ölçeklendiği, üstelik önerilen mekanizmanın öngördüğü yönde
 ölçeklendiği gösterildi. CUSUM parametreleri ilk kez gerçek trafikte kalibre
 edildi ve iki sabitin yanlış olduğu bulundu.
@@ -54,13 +55,13 @@ greedy-vs-canonical farkı yalnızca chunk sırasına atfedilebiliyor.
 
 ### 2.1 k=3'te hiçbir kol ayrışmadı
 
-| Kol | hit rate |
+| Kol | ortalama istek-başı cache oranı |
 |---|---|
 | canonical | 79.1% |
 | relevance | 78.7% |
 | greedy | 81.1% |
 
-Toplam yayılım 2.7pp, tek koşu. Kalite farkları da `score_quality`'nin %3
+Toplam yayılım 2.4pp, tek koşu. Kalite farkları da `score_quality`'nin %3
 gürültü eşiğinin altında. **Bu bir bulgu:** top_k=3'te sıralama kaldıracı
 yalnızca 3 chunk'ı permüte edebiliyor, ablation etkiyi görmek için fazla dar.
 
@@ -88,15 +89,17 @@ Fark 10.2pp, gürültü eşiği 0.4pp → **25 katı**.
 
 ### 2.3 Rapora yazılabilecek cümle
 
-> greedy, kalite kaybetmeden canonical'a göre %8.1 daha yüksek cache hit rate
-> ve %28 daha düşük TTFT p50 sağlıyor.
+> greedy, canonical'a göre ortalama istek-başı cache oranını +8.1 yüzde puan
+> artırıyor ve TTFT p50'yi göreli %27.9 düşürüyor; ana kalite metriğinde
+> relevance sırasından ayrışmıyor.
 
 Kalite tarafında greedy (79.6%) ile relevance (79.9%) arasındaki 0.3pp fark
-±0.2–0.4 sapmayla **ayırt edilemez**. Yani "greedy kalitede de kazandı"
-denemez; "greedy kalite kaybetmeden cache kazandırdı" denebilir. CacheWeaver'ın
+±0.2–0.4 sapmayla **ayırt edilemez**. Yani "greedy kalitede de kazandı" veya
+"kalite kaybı kesinlikle yok" denemez; yalnızca bu ölçümde kalite farkının
+ayrışmadığı söylenebilir. CacheWeaver'ın
 kendi makalesinin ve paper'ın Bölüm III-C.2'sinin açık bıraktığı risk — greedy
-reorder'ın alakalı chunk'ı sona itip kaliteyi düşürmesi — bu iş yükünde
-gerçekleşmiyor. 10 chunk'ın 7.17'si yer değiştirdiği hâlde.
+reorder'ın alakalı chunk'ı sona itip kaliteyi düşürmesi — bu tek iş yükünde ve
+contains-gold metriğinde gözlenmedi. 10 chunk'ın 7.17'si yer değiştirdiği hâlde.
 
 **greedy teşhis verileri (k=10):** reorder depth ortalama 7.17/10, %84.0'ünde
 sıfırdan büyük, isteklerin %43.3'ünde sıra değişiyor.
@@ -108,8 +111,9 @@ sıfırdan büyük, isteklerin %43.3'ünde sıra değişiyor.
 Tasarım: aynı session'da bir önceki turda servis edilen ve bu turda tekrar
 retrieve edilen chunk'lar öne, **önceki sıralarıyla**; kalan relevance
 sırasında. Gerekçe: projenin kendi merkezi ölçümü, session-adjacent overlap
-0.48 iken global-adjacent 0.055 — yani gerçekten cache'te olma ihtimali en
-yüksek chunk'lar bunlar.
+0.48 iken global-adjacent 0.055. Bu, session affinity korunuyorsa önceki turdan
+tekrarlanan chunk'ların cache'te olabileceği hipotezini kuruyor; kol worker
+kimliğini sabitlemediği için gerçek cache yerleşimini tek başına kanıtlamıyor.
 
 ### 3.1 Mekanizma doğru çalıştı
 
@@ -121,39 +125,40 @@ yapısını birebir takip ediyor.
 
 ### 3.2 Ama sonuç negatif
 
-62.9% ±0.2% ile dört kolun **sonuncusu**. relevance tarafından tamamen domine
-ediliyor: relevance 67.7% cache + 79.9% kalite verirken, pinned 62.9% cache +
-79.7% kalite veriyor. Kaliteyi koruyor, cache'i aktif olarak bozuyor.
+62.9% ±0.2% cache oranı ve 0.161s TTFT ile dört kolun **sonuncusu**. Relevance
+67.7% cache + 79.9% kalite verirken pinned 62.9% cache + 79.7% kalite veriyor;
+ana kalite metriği yakın kalırken cache ve TTFT sonuçları kötüleşiyor.
 
-**Nedeni teşhis edildi:** k=10'da `full=0.0%` — hiçbir istekte tüm chunk'lar
+**Olası açıklama:** k=10'da `full=0.0%` — hiçbir istekte tüm chunk'lar
 pinlenmiyor, ortalama 3.38/10 pinleniyor. Yani prompt'un başına ~3 chunk'lık
 **session'a özgü** bir önek koyup arkasına 6.6 taze chunk diziliyor. Her session
-kendine özel bir sıra üretiyor, session'lar arası paylaşım ölüyor. Sıra
-isteklerin %65.7'sinde değişiyor, karşılığında kazanç yok.
+kendine özel bir sıra üretiyor; bu, session'lar arası prefix tutarlılığını
+azaltmış olabilir. Sıra isteklerin %65.7'sinde değişiyor, karşılığında kazanç
+yok; deney bu nedensel yolu doğrudan ölçmüyor.
 
 ### 3.3 Asıl bulgu — dört kolun ortak örüntüsü
 
 Dört kolu yan yana koyunca ortaya çıkan şey, tek tek sonuçlardan daha güçlü:
 
-> **Cache durumunu bilmeden sıra dayatan her şema, retriever'ın sırasını olduğu
-> gibi bırakmaktan daha kötü.**
+> **Denenen iki cache-oblivious şema, retriever'ın sırasını olduğu gibi
+> bırakmaktan daha kötü.**
 
 - canonical (chunk_id'ye göre diz): 65.0% — relevance'ın altında
 - pinned_prefix (session geçmişine göre diz): 62.9% — relevance'ın altında
 - relevance (hiç dizme): 67.7%
-- greedy (gerçek cache durumuna göre diz): 73.1% — **tek kazanan**
+- greedy (tahminî global cache-history ağacına göre diz): 73.1% — **tek kazanan**
 
-Açıklaması: relevance sıralaması zaten *tesadüfen* prefix paylaşımı üretiyor,
-çünkü benzer sorgular chunk'ları benzer şekilde sıralıyor. canonical ve
-pinned_prefix bu doğal istikrarı bozup yerine cache'le ilgisi olmayan bir yapı
-koyuyor — biri global, diğeri session'a özel, ikisi de kaybettiriyor.
+Sonuç, relevance sıralamasının benzer sorgularda benzer prefix'ler üretmiş
+olabileceği ve cache-oblivious dayatmaların bu tutarlılığı bozduğu hipoteziyle
+uyumlu. Deney prefix paylaşım yolunu doğrudan ölçmediği için bu açıklama kanıt
+olarak sunulmuyor.
 
 Bu, faz 2'nin kurgusunu değiştiriyor: soru "hangi sıralama şeması" değil,
 **"sıralama cache durumunu biliyor mu"**.
 
-Kalite tarafı da tutarlı: canonical tek başına düşük (77.8%), çünkü relevance
-sıralamasını tümden yok eden tek kol o. pinned_prefix kuyruğu relevance'ta
-bıraktığı için kaliteyi koruyor — sadece hiçbir işe yaramıyor.
+Kalite tarafında canonical 77.8%, relevance 79.9%, greedy 79.6% ve
+`pinned_prefix` 79.7% ölçülüyor. Bu farklar neden-sonuç açıklaması veya eşdeğerlik
+kanıtı değil; yalnızca prespecified spread kuralıyla yorumlanıyor.
 
 ---
 
@@ -178,18 +183,16 @@ inandığı**. O yüzden ölçüm router inancı ile motorun kendi raporu arası
 | **completion** az-tahmin | 6.2% ±0.7% | 29.6% ±0.8% |
 | **fark / gürültü** | 1.45× | **10.3×** |
 
-### 4.1 Kanıt asimetride
+### 4.1 Yük etkileşimi mekanizma hipoteziyle uyumlu
 
-Yük 3 katına çıkarken **dispatch hiç bozulmadı**, completion çöktü. Mekanizmanın
-öngördüğü tam olarak bu: completion-time kayıt uçuştaki kardeş istekleri
-göremediği için yük arttıkça daha çok kaçırır; dispatch-time kayıt tanımı gereği
-kaçıramaz. İki kol da yükten etkilenseydi bu "yük her şeyi bozar" olurdu; sadece
-birinin ve öngörülen yönde bozulması **açıklamayı** doğruluyor.
+Yük 3 katına çıkarken dispatch'in routing-relevant korelasyon ve sıra uyumu
+yaklaşık sabit kaldı, completion ise bozuldu. Önerilen mekanizma şudur:
+completion-time kayıt uçuştaki kardeş istekleri henüz göremez; dispatch-time
+kayıt onları hemen görür, fakat başarısız bir prefill'i fazla tahmin edebilir.
+Yükle birlikte yalnız completion tarafının bozulması bu açıklamayla uyumludur,
+ancak tek nedeni izole etmez.
 
-Tek bir sayıyı tekrarlamak sayıyı doğrular; yükle birlikte tahmin edilen yönde
-büyüdüğünü göstermek mekanizmayı doğrular.
-
-### 4.2 Paper'ın sayılarıyla çelişki yok — eksik nitelendirme var
+### 4.2 Önceki tek koşu doğrudan karşılaştırılabilir değil
 
 | | paper (n=1) | speedup=5 | speedup=15 |
 |---|---|---|---|
@@ -197,8 +200,10 @@ büyüdüğünü göstermek mekanizmayı doğrular.
 | completion korelasyon | 0.749 | 0.941 | 0.806 |
 | **fark** | **0.183** | 0.032 | **0.175** |
 
-Paper'ın tek koşusu yüksek-yük rejimindeymiş. Sayılar yanlış değil, **yük
-koşulu yazılmamış**. Düşük eşzamanlılıkta fark neredeyse yok (0.032).
+Paper'ın önceki tek koşusunun yük koşulu kaydedilmemiş ve eski dispatch-bias
+işareti yeni protokolde yeniden üretilmemiştir. Bu nedenle eski satır yeni
+sweep'le eşdeğer bir hücre sayılmaz. Yeni speedup=5 koşusunda korelasyon farkı
+0.031, speedup=15'te ise 0.174'tür.
 
 ### 4.3 Teoriyi güçlendiren detay
 
@@ -206,7 +211,8 @@ Paper dispatch bias'ını −13.6 diyor, yani dispatch *az* tahmin ediyor — ki
 kendi açıklamasıyla çelişiyordu. Dispatch-time kayıt tanımı gereği **iyimser**:
 prefill olmadan bloğu cache'te sayıyorsun, *fazla* tahmin etmeli. Yeni ölçüm
 her iki yükte de pozitif (+31.3 ve +23.7). Ayrıca dispatch'in az-tahmin oranı
-altı koşunun tamamında tam %0.0 — yapısal olarak az tahmin edemiyor.
+altı koşunun tamamında %0.0; bu, gözlenen koşuların sonucudur ve yapısal bir
+imkânsızlık iddiası değildir.
 
 ---
 
@@ -235,25 +241,27 @@ Veri: `trace.jsonl` (stable, 2170 gözlem) ve `--drift 0.1` ile üretilmiş
 **kararlı trafikte drift'ten daha çok** alarm veriyor (0.20/0.08/0.30: stable
 68.2, drift 28.5 → 0.42×). Sinyal ters. k=10'da yön düzeliyor.
 
-### 5.2 Mevcut varsayılanlar bozuk, düzeltmesi tek parametre
+### 5.2 Kalibrasyon öncesi varsayılanlar bozuktu
 
 top_k=10, `lam=0.1`, `k=0.03` sabit:
 
-| `CUSUM_H` | yanlış alarm /1000 | ayrım |
+| `CUSUM_H` | nominal-trace alarmı /1000 | ayrım |
 |---|---|---|
-| **0.20** (mevcut) | 108.76 (isteklerin %10.9'u) | 1.52× |
+| **0.20** (önceki) | 108.76 (isteklerin %10.9'u) | 1.52× |
 | **0.30** | 26.73 (%2.7) | **2.20×** |
 
-`h=0.30` **iki eksende birden** daha iyi: 4 kat az yanlış alarm, üstelik daha
-iyi ayrım. Her alarm `d_ref`'i yeniden kalibre edip beta'yı ölçeklediği için
-%10.9'luk yanlış alarm oranı, adaptivitenin sürekli kendi kuyruğunu kovalaması
-demek.
+`h=0.30` **iki eksende birden** daha iyi: nominal trace üzerinde 4 kat az alarm
+ve daha iyi ayrım. Ancak nominal trace'te etiketli değişim noktaları olmadığı
+için bunlar kesin "yanlış pozitif" değil, yalnızca muhafazakâr bir vekil
+metriktir. Dahası, mevcut kodda CUSUM alarmı routing beta/delta değerlerini
+değiştirmez; bu kalibrasyon routing kazancını değil, tanısal telemetrinin alarm
+davranışını iyileştirir.
 
 ### 5.3 `D_TARGET` de yanlış — ve top_k'ya bağlı
 
 | | ölçülen `d_ref` |
 |---|---|
-| `config.py`'deki değer | 0.529 |
+| kalibrasyon öncesi `config.py` değeri | 0.529 |
 | trace.jsonl, top_k=3 | 0.478 |
 | trace.jsonl, **top_k=10** | **0.322** |
 
@@ -270,7 +278,7 @@ Takas eğrisi (en iyi ayrım, her yanlış-alarm bütçesinde):
 | 25 | 1.71× | 0.05 | 0.08 | 0.30 |
 | 50 | **2.20×** | 0.10 | 0.03 | 0.30 |
 
-Yanlış alarmı 1/1000'in altına çekersen ayrım 1.35×'e düşüyor — 2170 gözlemde
+Nominal-trace alarm bütçesini 1/1000'in altına çekersen ayrım 1.35×'e düşüyor — 2170 gözlemde
 3 alarma karşı 4 alarm, yani gürültü.
 
 **Denenip reddedilen bir düzeltme:** gürültünün kaynağı olarak CUSUM'a ham
@@ -287,9 +295,10 @@ ROUTER_CUSUM_K=0.03        # değişmiyor
 ROUTER_DRIFT_LAM=0.1       # değişmiyor
 ```
 
-Dürüst sınır: kalibrasyondan sonra bile ayrım gücü 2.20× ve bu %2.7 yanlış alarm
-karşılığında geliyor. Drift-adaptif mekanizma bu iş yükünde iddia ettiği kadarını
-yapmıyor.
+Dürüst sınır: kalibrasyondan sonra bile ayrım gücü 2.20× ve bu nominal trace'te
+%2.7 alarm karşılığında geliyor. Bu yalnızca detektör telemetrisini değerlendirir;
+alarm mevcut routing kararını kontrol etmediği için drift-adaptif routing kazancı
+gösterilmiş değildir.
 
 ---
 
@@ -297,32 +306,34 @@ yapmıyor.
 
 1. **Faz 2'nin çerçevesi.** `score_quality.py`'nin docstring'i ve ablation'ın
    kurgusu "canonical ordering cache hit rate'i yükseltti" varsayımına dayanıyor.
-   k=10'da canonical iki eksende de sonuncu (§3.3). Soru "hangi şema" değil,
-   "şema cache durumunu biliyor mu".
+   k=10'da canonical, relevance sırasının hem cache hem TTFT sonucundan geri;
+   `pinned_prefix` ise bu iki ölçütte daha da kötü (§3.3). Soru "hangi şema"
+   değil, "şema cache geçmişini kullanıyor mu".
 
-2. **Bölüm VI-E'nin yük koşulu.** Tablo yük seviyesi belirtilmeden verilmiş.
-   Sayılar doğru ama speedup=5'te fark 0.032, speedup=15'te 0.175 (§4.2).
-   Yük koşulu eklenmeli.
+2. **Bölüm VI-E'nin yük koşulu.** Güncel paper iki yük seviyesini de veriyor:
+   speedup=5'te korelasyon farkı 0.031, speedup=15'te 0.174 (§4.2).
 
-3. **Bölüm V-B'nin kalibrasyon tablosu.** `D_TARGET=0.529` k=3'te ölçülmüş,
-   deneyler k=10'da; doğrusu 0.322 (§5.3). `CUSUM_H` de düzeltilmeli.
+3. **Bölüm IV-C'nin kalibrasyon tablosu.** Güncel paper `D_TARGET=0.322` ve
+   `CUSUM_H=0.30` değerlerini, ölçüm kaynağı ve kapsam sınırlarıyla veriyor.
 
 ---
 
 ## 7. Bilinen sınırlar
 
-- **`TRACKER_CAPACITY` kalibre değil.** Tüm koşularda 50000 varsayılanında
-  sabit tutuldu. Bu ablation'lar için kollar arası bir confound değil (hepsini
-  aynı şekilde etkiliyor, sıralamayı değiştirmiyor) ama mutlak sayıları
-  etkiliyor. Paper'da açıkça belirtilmeli — Bölüm VI-B zaten bu sabitin bir
-  ablation'ı ters çevirdiğini anlatıyor, hakem soracaktır.
-- Tek trace şekli (`trace_hot`), tek korpus, 300 istek, 2 worker.
+- **`TRACKER_CAPACITY` kalibre değil.** Yeni ordering/timing koşuları 50000
+  varsayılanında sabit tutuldu. Kollar arasında doğrudan bir ayar değişikliği
+  yoktur; ancak kapasite-politika etkileşimi dışlanamaz ve mutlak sonuçlar
+  kalibre deployment iddiası taşımaz. Paper bunu açıkça belirtiyor; Bölüm VI-B
+  bu sabitin başka bir ablation'ı ters çevirebildiğini gösteriyor.
+- Ordering ve timing sweep'leri tek trace şekli (`trace_hot`), tek korpus,
+  300 istek ve 2 worker ile sınırlı.
 - Sıralama sonuçları yalnızca **k=10** için geçerli; k=3'te hiçbir kol
   ayrışmıyor. İddia "k=10'da" diye nitelendirilmeli.
 - `pinned_prefix` tek bir tasarım varyantı (session geçmişi). Global hot-set
   veya canonical-baş/relevance-kuyruk varyantları denenmedi.
 - CUSUM kalibrasyonu tek bir drift seviyesinde (`--drift 0.1`). İkinci bir
-  seviye (0.5) alarm oranının drift şiddetiyle arttığını gösterirdi.
+  seviye, alarm davranışının drift şiddetiyle nasıl değiştiğini sınamak için
+  gereklidir.
 
 ---
 
@@ -333,7 +344,7 @@ yapmıyor.
 | `bench/replay.py` | `--order greedy` ve `--order pinned_prefix` kolları, greedy bayrakları, teşhis metrikleri |
 | `bench/score_quality.py` | 2 dosya yerine N dosya (3. kol sessizce düşüyordu) |
 | `bench/sweep_ordering.py` | Sıralama ablation'ı × N tekrar, restart koreografisi, ayrışma hükmü |
-| `bench/sweep_timing.py` | dispatch/completion × N tekrar, mekanizmayı doğrudan test eden hüküm |
+| `bench/sweep_timing.py` | dispatch/completion × N tekrar, iki yükte etkileşim testi |
 | `bench/calibrate_cusum.py` | CUSUM grid taraması, ayrım oranı, takas tablosu |
 | `bench/check_lag.py` | Koşuların programını tutup tutmadığı |
 | `bench/validate_tracker.py` | `compute()`/`report()` ayrımı (sweep'in toplayabilmesi için) |
@@ -359,12 +370,13 @@ yapmıyor.
 
 ## 9. Sırada ne var
 
-**Tier 1 bitti** (A, B, C, D, N, O).
+**Tier 1 bitti** (A, B, C, D, N, O). Sonuçlar `paper/paper.tex`'e işlendi;
+`config.py` varsayılanları `CUSUM_H=0.30` ve `D_TARGET=0.322` olarak güncellendi.
 
 Yapılmadı:
 
-- Bu dört sonucun hiçbiri `paper/paper.tex`'e işlenmedi. §6'daki üç düzeltme
-  bekliyor.
-- `config.py`'de `CUSUM_H` ve `D_TARGET` hâlâ eski değerlerde.
+- Merkezi sistem karşılaştırması: `per_worker_tree` ile global worker-kör
+  `greedy`, eşlenmiş prompt serileştirmesi ve uçtan uca zamanlayıcıyla henüz
+  karşılaştırılmadı.
 - Tier 3: J (Load(w) formel modelleme), K (DecodeTime belirsizliği),
   L (k=10 bulgusu — artık §2.2'de ölçülmüş hâli var), M (mean_kv_usage EWMA).
