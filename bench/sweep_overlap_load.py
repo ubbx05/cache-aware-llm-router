@@ -92,12 +92,9 @@ class StrategyConfig:
 # strategies.PerWorkerTreeStrategy, config.OVERLAP_ADAPTIVE_MODE) +
 # semantic_per_worker_tree. semantic_per_worker_tree de decide_order()
 # uyguladigi icin (per_worker_tree ile ayni iki-asamali akis) order=
-# "per_worker_tree" kullaniyor -- ancak main.py'nin /router/decide_order
-# endpoint'i su an query_text tasimiyor (bkz. strategies.py'deki
-# SemanticPerWorkerTreeStrategy docstring'i, "SINIRLAMA"), yani bu koşuda
-# semantik on-filtre sessizce devre disi kalir, duz per_worker_tree gibi
-# davranir -- yine de gecerli bir baseline noktasi (per_worker_tree'nin
-# hicbir semantik/adaptif katmani olmayan hali).
+# "per_worker_tree" kullaniyor. replay.py iki-asamali istekte soru metnini
+# query_text olarak yollar; semantic top-k gercekten aday eleyebilsin diye iki
+# worker'li bir deneyde ROUTER_SEMANTIC_TOP_K=1 kullanilmalidir.
 STRATEGY_CONFIGS: list[StrategyConfig] = [
     StrategyConfig("round_robin", {"ROUTER_STRATEGY": "round_robin"}, "canonical"),
     StrategyConfig("least_loaded", {"ROUTER_STRATEGY": "least_loaded"}, "canonical"),
@@ -136,8 +133,14 @@ class CellResult:
     n_failed: int = 0
     ttft_p50_s: float = float("nan")
     ttft_p95_s: float = float("nan")
+    ttft_p99_s: float = float("nan")
+    e2e_ttft_p50_s: float = float("nan")
+    e2e_ttft_p99_s: float = float("nan")
     throughput_req_s: float = float("nan")
     cache_hit_rate: float = float("nan")
+    cache_metric: str = "unavailable"
+    cached_tokens_total: int = 0
+    prompt_tokens_total: int = 0
     load_cv: float = float("nan")
     error: str = ""
 
@@ -150,7 +153,10 @@ def pct(values: list[float], p: int) -> float:
         return float("nan")
     if len(values) == 1:
         return values[0]
-    return statistics.quantiles(sorted(values), n=100)[p - 1]
+    # The default "exclusive" method extrapolates outside the observed range
+    # for small samples (for example a two-value p99 can exceed max(values)).
+    # Inclusive quantiles remain bounded and match replay.py's summary.
+    return statistics.quantiles(sorted(values), n=100, method="inclusive")[p - 1]
 
 
 def gen_trace(args, zipf_s: float, out_path: Path) -> None:
@@ -168,7 +174,8 @@ def gen_trace(args, zipf_s: float, out_path: Path) -> None:
                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
 
-def start_router(args, env_overrides: dict[str, str], port: int) -> subprocess.Popen:
+def start_router(args, env_overrides: dict[str, str], port: int,
+                 log_path: Path) -> subprocess.Popen:
     """main.py'yi (uvicorn) verilen env override'lariyla ayri bir surec
     olarak baslatir. STRATEGY/OVERLAP_ADAPTIVE main.py'nin startup'inda BIR
     KERE okunuyor (bkz. modul docstring'i), o yuzden her strateji icin
@@ -184,10 +191,22 @@ def start_router(args, env_overrides: dict[str, str], port: int) -> subprocess.P
             env["W2_ENABLED"] = "true"
     cmd = [sys.executable, "-m", "uvicorn", "main:app",
           "--host", "127.0.0.1", "--port", str(port)]
-    return subprocess.Popen(
-        cmd, cwd=REPO_ROOT, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    )
+
+    # Do not leave uvicorn attached to an unread PIPE.  Its access log can fill
+    # a ~64 KiB pipe during a long replay and block the router process itself.
+    # Keep the file handle on the Popen object so stop_router can close it.
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("wb")
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=REPO_ROOT, env=env,
+            stdout=log_handle, stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        log_handle.close()
+        raise
+    proc._router_log_handle = log_handle  # type: ignore[attr-defined]
+    return proc
 
 
 async def wait_healthy(base_url: str, timeout_s: float) -> None:
@@ -211,12 +230,18 @@ async def wait_healthy(base_url: str, timeout_s: float) -> None:
 
 
 def stop_router(proc: subprocess.Popen, timeout_s: float = 10.0) -> None:
-    proc.terminate()
     try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=timeout_s)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=timeout_s)
+    finally:
+        log_handle = getattr(proc, "_router_log_handle", None)
+        if log_handle is not None and not log_handle.closed:
+            log_handle.close()
 
 
 def run_replay(args, trace_path: Path, router_url: str, order: str,
@@ -240,7 +265,8 @@ def run_replay(args, trace_path: Path, router_url: str, order: str,
                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
 
-def score_results(results_path: Path) -> CellResult:
+def score_results(results_path: Path,
+                  expected_workers: list[str] | None = None) -> CellResult:
     """replay.py'nin yazdigi results.jsonl'i okuyup hucre metriklerini
     cikarir -- replay.py'nin kendi summarise() ciktisini yeniden ayristirmak
     yerine ayni ham satirlari (Result.__dict__) dogrudan kullaniyoruz."""
@@ -256,6 +282,16 @@ def score_results(results_path: Path) -> CellResult:
     ttfts = [r["ttft_s"] for r in ok]
     res.ttft_p50_s = pct(ttfts, 50)
     res.ttft_p95_s = pct(ttfts, 95)
+    res.ttft_p99_s = pct(ttfts, 99)
+
+    e2e_ttfts = [
+        float(r["e2e_ttft_s"])
+        for r in ok
+        if r.get("e2e_ttft_s") is not None
+    ]
+    if e2e_ttfts:
+        res.e2e_ttft_p50_s = pct(e2e_ttfts, 50)
+        res.e2e_ttft_p99_s = pct(e2e_ttfts, 99)
 
     # Throughput: istek basina toplam sure / concurrency yerine, gozlenen
     # araligin (ilk gonderim - son bitis) uzerinden -- sweep_batch.py'nin
@@ -267,20 +303,42 @@ def score_results(results_path: Path) -> CellResult:
         span = max(ends) - min(starts)
         res.throughput_req_s = len(ok) / span if span > 0 else float("nan")
 
-    fracs = [r["actual_frac"] for r in ok if r.get("actual_frac") is not None]
-    if fracs:
-        res.cache_hit_rate = statistics.fmean(fracs)
+    # Primary metric: token-weighted engine truth.  This is invariant to the
+    # distribution of prompt lengths across arms.  Old JSONL artifacts may
+    # have only actual_frac, so retain a deliberately labelled macro fallback
+    # rather than silently changing the meaning of cache_hit_rate.
+    token_pairs = [
+        (int(r["actual_cached_tokens"]), int(r["prompt_tokens"]))
+        for r in ok
+        if r.get("actual_cached_tokens") is not None
+        and r.get("prompt_tokens") is not None
+        and int(r["prompt_tokens"]) > 0
+    ]
+    if token_pairs:
+        res.cached_tokens_total = sum(cached for cached, _ in token_pairs)
+        res.prompt_tokens_total = sum(prompt for _, prompt in token_pairs)
+        res.cache_hit_rate = res.cached_tokens_total / res.prompt_tokens_total
+        res.cache_metric = "aggregate_cached_tokens/prompt_tokens"
+    else:
+        fracs = [
+            float(r["actual_frac"])
+            for r in ok
+            if r.get("actual_frac") is not None
+        ]
+        if fracs:
+            res.cache_hit_rate = statistics.fmean(fracs)
+            res.cache_metric = "macro_mean_actual_frac_fallback"
 
-    worker_counts: dict[str, int] = {}
+    worker_counts: dict[str, int] = {
+        worker: 0 for worker in (expected_workers or [])
+    }
     for r in ok:
         w = r.get("worker") or "?"
         worker_counts[w] = worker_counts.get(w, 0) + 1
-    if len(worker_counts) > 1:
+    if worker_counts:
         counts = list(worker_counts.values())
         mean = statistics.fmean(counts)
         res.load_cv = (statistics.pstdev(counts) / mean) if mean > 0 else float("nan")
-    else:
-        res.load_cv = 0.0  # tek worker'a hepsi gitmisse dagilim yok, CV=0 anlamli
 
     return res
 
@@ -345,7 +403,8 @@ def run(args) -> None:
     for overlap_label, zipf_s in OVERLAP_LEVELS:
         for sc in strategies:
             print(f"\n== router baslatiliyor: strategy={sc.label} port={port} ==")
-            proc = start_router(args, sc.env, port)
+            log_path = work_dir / f"router_{port}_{overlap_label}_{sc.label}.log"
+            proc = start_router(args, sc.env, port, log_path)
             try:
                 asyncio.run(wait_healthy(f"http://127.0.0.1:{port}", args.startup_timeout))
             except TimeoutError as exc:
@@ -365,7 +424,8 @@ def run(args) -> None:
                 try:
                     run_replay(args, trace_paths[overlap_label],
                               f"http://127.0.0.1:{port}", sc.order, speedup, out_path)
-                    res = score_results(out_path)
+                    expected_workers = [f"w{i + 1}" for i in range(len(args.worker))]
+                    res = score_results(out_path, expected_workers)
                 except subprocess.CalledProcessError as exc:
                     res = CellResult(overlap_level="", load_level="", strategy="",
                                      speedup=0.0, zipf_s=0.0, error=str(exc))

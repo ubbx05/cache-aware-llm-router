@@ -116,6 +116,14 @@ class Result:
     actual_cached_tokens: int | None = None
     prompt_tokens: int | None = None
 
+    # One-phase requests have decision_s=0 and e2e_* equal to the historical
+    # ttft_s/total_s fields.  For per_worker_tree, historical ttft_s/total_s
+    # remain phase-2-only so old analyses keep working, while e2e_* includes
+    # /router/decide_order, reordering, prompt construction and phase 2.
+    decision_s: float | None = None
+    e2e_ttft_s: float | None = None
+    e2e_total_s: float | None = None
+
     # --order greedy only. `greedy_depth` is how many leading chunks of the
     # order we shipped were already on a cached root path, measured against
     # the tree BEFORE this request was inserted into it -- i.e. the reusable
@@ -150,10 +158,10 @@ class Result:
         return (self.total_s - self.ttft_s) / (self.output_tokens - 1)
 
 
-# MUST match main.py's CHUNK_SEP exactly, byte for byte -- see the comment
-# there. Only used when --order per_worker_tree; canonical/relevance keep
-# joining with plain "\n\n", so every previously-measured run (top_k A/B,
-# tracker validation, 2-worker comparison) is completely unaffected by this.
+# MUST match main.py's CHUNK_SEP exactly, byte for byte.  Retained for clients
+# that exercise the one-phase server-side rewrite path; the benchmark's normal
+# two-phase path now builds the final order itself and deliberately uses the
+# same plain "\n\n" separator as every comparison arm.
 CHUNK_SEP = "\n\n<<<CHUNK>>>\n\n"
 
 
@@ -221,6 +229,7 @@ async def fire(client: httpx.AsyncClient, args, rec: dict, messages: list[dict],
     }
 
     start = time.perf_counter()
+    res.decision_s = 0.0
     try:
         async with client.stream("POST", f"{args.router}/v1/chat/completions",
                                  json=payload, headers=headers) as r:
@@ -265,12 +274,14 @@ async def fire(client: httpx.AsyncClient, args, rec: dict, messages: list[dict],
                 if delta.get("content"):
                     if res.ttft_s is None:
                         res.ttft_s = time.perf_counter() - start
+                        res.e2e_ttft_s = res.ttft_s
                     res.output_tokens += 1
                     res.output_text += delta["content"]
     except Exception as exc:  # noqa: BLE001
         res.error = f"{type(exc).__name__}: {exc}"
 
     res.total_s = time.perf_counter() - start
+    res.e2e_total_s = res.total_s
     return res
 
 
@@ -279,7 +290,7 @@ async def fire_two_phase(client: httpx.AsyncClient, args, rec: dict,
                          question: str, t0: float) -> Result:
     """per_worker_tree only: calls /router/decide_order FIRST with the raw
     (retrieval-order) chunk ids, builds the prompt with the RETURNED order
-    (using CHUNK_SEP so main.py could in principle re-split it), then sends
+    (using the same plain separator as the one-phase comparison arms), then sends
     the real completion with x-router-force-worker so /v1/chat/completions
     skips select() and goes straight to the already-chosen worker. Kept as a
     separate function from fire() on purpose -- zero risk of the extra
@@ -296,18 +307,28 @@ async def fire_two_phase(client: httpx.AsyncClient, args, rec: dict,
     )
     res.retrieval_hit = bool(set(res.retrieved) & set(res.expected))
 
+    e2e_start = time.perf_counter()
     try:
         dr = await client.post(f"{args.router}/router/decide_order",
-                               json={"chunk_ids": chunk_ids})
+                               json={"chunk_ids": chunk_ids, "query_text": question})
         dr.raise_for_status()
         decided = dr.json()
     except Exception as exc:  # noqa: BLE001
+        res.decision_s = time.perf_counter() - e2e_start
+        res.e2e_total_s = res.decision_s
         res.error = f"decide_order failed: {type(exc).__name__}: {exc}"
         return res
 
+    res.decision_s = time.perf_counter() - e2e_start
+
     worker_name = decided.get("worker")
     ordered_ids = decided.get("ordered_chunk_ids") or chunk_ids
-    blocks = CHUNK_SEP.join(id_to_text[c] for c in ordered_ids)
+    # The client already received the final order from phase one and forces that
+    # same worker in phase two, so no server-side split/rewrite is needed here.
+    # Use the identical separator as one-phase arms; the old sentinel added five
+    # Qwen tokens at each of nine boundaries for top_k=10 and confounded the
+    # system comparison with a ~45-token/request prompt-template change.
+    blocks = "\n\n".join(id_to_text[c] for c in ordered_ids)
     messages = [
         {"role": "system", "content": f"{SYSTEM_PROMPT}\n\nBağlam:\n\n{blocks}"},
         {"role": "user", "content": question},
@@ -327,7 +348,7 @@ async def fire_two_phase(client: httpx.AsyncClient, args, rec: dict,
         "x-session-id": str(rec["session_id"]),
     }
 
-    start = time.perf_counter()
+    start = time.perf_counter()  # phase-2 clock retained for backward compatibility
     try:
         async with client.stream("POST", f"{args.router}/v1/chat/completions",
                                  json=payload, headers=headers) as r:
@@ -364,13 +385,16 @@ async def fire_two_phase(client: httpx.AsyncClient, args, rec: dict,
                 delta = choices[0].get("delta") or {}
                 if delta.get("content"):
                     if res.ttft_s is None:
-                        res.ttft_s = time.perf_counter() - start
+                        now = time.perf_counter()
+                        res.ttft_s = now - start
+                        res.e2e_ttft_s = now - e2e_start
                     res.output_tokens += 1
                     res.output_text += delta["content"]
     except Exception as exc:  # noqa: BLE001
         res.error = f"{type(exc).__name__}: {exc}"
 
     res.total_s = time.perf_counter() - start
+    res.e2e_total_s = time.perf_counter() - e2e_start
     return res
 
 
@@ -618,9 +642,11 @@ def summarise(results, before, after, wall, args, out: Path) -> None:
     failed = len(results) - len(ok)
 
     def pct(vals, p):
-        return statistics.quantiles(sorted(vals), n=100)[p - 1] if len(vals) > 1 else (vals[0] if vals else float("nan"))
+        return (statistics.quantiles(sorted(vals), n=100, method="inclusive")[p - 1]
+                if len(vals) > 1 else (vals[0] if vals else float("nan")))
 
     ttfts = [r.ttft_s for r in ok]
+    e2e_ttfts = [r.e2e_ttft_s for r in ok if r.e2e_ttft_s is not None]
     tpots = [r.tpot_s for r in ok if r.tpot_s is not None]
     lags = [r.sent_s - r.scheduled_s for r in results]
 
@@ -637,6 +663,9 @@ def summarise(results, before, after, wall, args, out: Path) -> None:
     print(f"schedule lag     : p50={pct(lags, 50) * 1000:.0f}ms  p99={pct(lags, 99) * 1000:.0f}ms")
     if ttfts:
         print(f"TTFT             : p50={pct(ttfts, 50):.3f}s  p90={pct(ttfts, 90):.3f}s  p99={pct(ttfts, 99):.3f}s")
+    if e2e_ttfts and any(abs(a - b) > 1e-9 for a, b in zip(ttfts, e2e_ttfts)):
+        print(f"TTFT end-to-end  : p50={pct(e2e_ttfts, 50):.3f}s  "
+              f"p90={pct(e2e_ttfts, 90):.3f}s  p99={pct(e2e_ttfts, 99):.3f}s")
     if tpots:
         print(f"TPOT             : p50={pct(tpots, 50) * 1000:.1f}ms")
     print(f"prefix cache     : {dh:.0f}/{dq:.0f} tokens = {dh / dq:.1%} hit rate" if dq > 0 else "prefix cache     : no data")

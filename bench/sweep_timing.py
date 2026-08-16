@@ -95,7 +95,8 @@ def one_run(args, mode: str, repeat: int) -> TimingRun:
     if args.tracker_capacity:
         env["ROUTER_TRACKER_CAPACITY"] = str(args.tracker_capacity)
 
-    proc = start_router(args, env, ROUTER_PORT)
+    log_path = Path(args.outdir) / f"router_{ROUTER_PORT}_{mode}_r{repeat + 1}.log"
+    proc = start_router(args, env, ROUTER_PORT, log_path)
     try:
         asyncio.run(wait_healthy(router_url, timeout_s=args.router_timeout))
         run_replay(args, Path(args.trace), router_url, args.order, args.speedup, out_path)
@@ -103,7 +104,8 @@ def one_run(args, mode: str, repeat: int) -> TimingRun:
         stop_router(proc)
 
     run = TimingRun(arm=mode, repeat=repeat, out_path=out_path)
-    run.hit_rate = score_results(out_path).cache_hit_rate
+    expected_workers = [f"w{i + 1}" for i in range(len(args.worker))]
+    run.hit_rate = score_results(out_path, expected_workers).cache_hit_rate
     try:
         d = compute(out_path)
     except SystemExit as exc:

@@ -1,400 +1,634 @@
-"""Repeat the ROUTING-STRATEGY comparison N times per arm and aggregate.
+"""Repeat the main routing-strategy comparison under one calibrated protocol.
 
-The strategy table in the report is currently one run per arm, and one run
-cannot tell a real gap from run-to-run spread. The concrete worry is specific:
-cache_aware reads 67.7% and cacheweaver_dualmap 66.8% in the single-run table,
-but their own 3x repeats (ca_r*/cwdm_r*) both land at 66.x -- so the headline
-gap may be noise. This script measures the spread instead of assuming it.
+The sweep is deliberately repeat-major and rotated.  Every strategy runs once
+before any strategy gets its second run, and the first strategy changes on
+each repeat.  This spreads slow machine drift across arms instead of turning
+it into an apparent strategy effect.
 
-Same design as sweep_ordering.py, with the ablation axis moved: there the arm
-was --order and ROUTER_STRATEGY was held constant, here the arm IS
-ROUTER_STRATEGY and the chunk order is held constant.
+Every live run also starts from a cold engine cache.  vLLM has no cache-reset
+endpoint in this deployment, so the script asks the operator to restart both
+workers before it starts a fresh router process.  Router stdout/stderr goes to
+a per-run file through ``sweep_overlap_load.start_router``; leaving uvicorn on
+an unread PIPE can fill the pipe buffer and deadlock a long replay.
 
-Three things this script does that a bash loop would not:
+The default table contains the five primary strategies.  ``--all-strategies``
+adds the adaptive and semantic variants.  A measured ``--tracker-capacity`` is
+mandatory for live runs, because the uncalibrated default has already changed
+the outcome of an ablation in this project.
 
-1. ARMS ARE INTERLEAVED AND ROTATED. Repeat-major, rotating the arm order each
-   repeat, so a slow drift in machine state (thermal, background load, GPU
-   clocks settling) spreads across all arms instead of landing on whichever
-   one ran three times in a row.
+Examples:
+    # Validate the 15-run plan without touching files or starting processes.
+    python sweep_strategy.py --dry-run
 
-2. per_worker_tree GETS ITS OWN --order. That strategy routes via a two-phase
-   /router/decide_order call, which replay.py only performs under
-   --order per_worker_tree. Passing canonical there would silently measure a
-   different thing than the strategy actually does. The mapping is explicit in
-   ORDER_FOR_STRATEGY below rather than left to the caller to remember.
+    # Main 5-strategy table: 800 requests, k=10, speedup=8, three repeats.
+    python sweep_strategy.py --corpus ./corpus --trace runs/trace_hot.jsonl \\
+        --worker http://100.89.101.52:8000 \\
+        --worker http://100.97.250.11:8000 \\
+        --tracker-capacity 5840
 
-3. THE TABLE REPORTS TAIL LATENCY AND BALANCE, not just the mean. The one
-   place cache_aware clearly separated from cacheweaver_dualmap in earlier
-   runs was TTFT p90/p99, and DualMap's worker split is locked (~538/800
-   across three repeats) by hash-ring skew. Both belong in the comparison.
-
-The engine restart is manual and cannot be skipped: vLLM's prefix cache is
-persistent, this deployment has no reset endpoint, and a warm cache inherited
-from the previous arm credits it to the next one. The router IS restarted
-automatically for the same reason -- its PrefixTracker would otherwise start
-the next arm confidently believing in blocks the engine no longer holds.
-
-Usage:
-    python sweep_strategy.py --corpus ./corpus --trace runs/trace_hot.jsonl \
-        --worker http://100.89.101.52:8000 --worker http://100.97.250.11:8000 \
-        --arms round_robin,least_loaded,cache_aware,cacheweaver_dualmap,per_worker_tree \
-        --repeats 3 --limit 800 --speedup 5 --top-k 3 \
-        --tracker-capacity 5840 --outdir runs/strat
+    # Include adaptive_cache_aware and semantic_per_worker_tree too.
+    python sweep_strategy.py --all-strategies ...
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
+import math
 import statistics
-import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any, Iterable
 
 BENCH_DIR = Path(__file__).resolve().parent
+# ``--dry-run`` promises no writes.  Set this before importing local modules so
+# Python cannot create bench/__pycache__ as a side effect of merely showing the
+# plan on a clean checkout.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(BENCH_DIR))
 
-import os  # noqa: E402
-import subprocess  # noqa: E402
-
+from score_quality import evaluate  # noqa: E402
 from sweep_overlap_load import (  # noqa: E402
-    REPO_ROOT,
-    run_replay as _run_replay,
+    run_replay,
     score_results,
+    start_router,
     stop_router,
     wait_healthy,
 )
-from score_quality import evaluate  # noqa: E402
-
-ROUTER_PORT = 8099  # deliberately not 8080, so a router left running by hand
-                    # cannot silently serve these runs instead
 
 
-def start_router(args, env_overrides: dict[str, str], port: int) -> subprocess.Popen:
-    """Same as sweep_overlap_load.start_router, but the router's own output
-    goes to a FILE instead of an unread pipe.
-
-    The upstream version passes stdout=PIPE/stderr=STDOUT and never reads it.
-    uvicorn writes an access-log line per request, so the 64 KB pipe buffer
-    fills mid-run, the router blocks forever on write(), stops accepting new
-    connections, and the replay hangs with no error at all -- it looks like an
-    infinite loop rather than a deadlock. It is size-dependent, which is why it
-    stayed hidden for so long: ~800 single-call requests sit right at the edge
-    and usually squeak past, while a strategy issuing two calls per request
-    (per_worker_tree: decide_order + completion) doubles the log and reliably
-    hits it. An earlier "per_worker_tree does not scale under concurrency"
-    observation was this bug, not the strategy.
-
-    The log is kept rather than sent to DEVNULL: when a cell does fail, the
-    router traceback is the only place the reason exists.
-    """
-    env = os.environ.copy()
-    env.update(env_overrides)
-    env["ROUTER_PORT"] = str(port)
-    if args.worker:
-        env["W1_URL"] = args.worker[0]
-        env["W1_ENABLED"] = "true"
-        if len(args.worker) > 1:
-            env["W2_URL"] = args.worker[1]
-            env["W2_ENABLED"] = "true"
-    log = open(Path(args.outdir) / f"router_{port}.log", "ab")
-    cmd = [sys.executable, "-m", "uvicorn", "main:app",
-           "--host", "127.0.0.1", "--port", str(port)]
-    proc = subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdout=log, stderr=log)
-    proc._router_log = log  # keep the handle alive until stop_router runs
-    return proc
-
-# Strategies whose routing decision is made through replay.py's two-phase
-# /router/decide_order path. Anything not listed uses --default-order.
-ORDER_FOR_STRATEGY = {
-    "per_worker_tree": "per_worker_tree",
-    "semantic_per_worker_tree": "per_worker_tree",
-}
-
-LAG_WARN_S = 1.0  # replay.py's own threshold, kept identical on purpose
+@dataclass(frozen=True)
+class StrategyConfig:
+    label: str
+    env: dict[str, str]
+    order: str
 
 
-def run_replay(*a, **kw) -> None:
-    """sweep_overlap_load.run_replay, but it does not eat the child's output."""
-    try:
-        _run_replay(*a, **kw)
-    except subprocess.CalledProcessError as exc:
-        out = exc.output.decode("utf-8", "replace") if exc.output else "(no output)"
-        print("\n--- replay.py failed, its output follows ---")
-        print(out.strip()[-4000:])
-        print("--- end replay.py output ---\n")
-        raise
+CORE_STRATEGIES: tuple[StrategyConfig, ...] = (
+    StrategyConfig("round_robin", {"ROUTER_STRATEGY": "round_robin"}, "canonical"),
+    StrategyConfig("least_loaded", {"ROUTER_STRATEGY": "least_loaded"}, "canonical"),
+    StrategyConfig(
+        "cacheweaver_dualmap",
+        {"ROUTER_STRATEGY": "cacheweaver_dualmap"},
+        "canonical",
+    ),
+    StrategyConfig("cache_aware", {"ROUTER_STRATEGY": "cache_aware"}, "canonical"),
+    StrategyConfig(
+        "per_worker_tree",
+        {
+            "ROUTER_STRATEGY": "per_worker_tree",
+            "ROUTER_OVERLAP_ADAPTIVE_MODE": "off",
+        },
+        "per_worker_tree",
+    ),
+)
+
+EXTRA_STRATEGIES: tuple[StrategyConfig, ...] = (
+    StrategyConfig(
+        "adaptive_cache_aware",
+        {"ROUTER_STRATEGY": "adaptive_cache_aware"},
+        "canonical",
+    ),
+    StrategyConfig(
+        "semantic_per_worker_tree",
+        {"ROUTER_STRATEGY": "semantic_per_worker_tree"},
+        "per_worker_tree",
+    ),
+)
+
+ALL_STRATEGIES: tuple[StrategyConfig, ...] = CORE_STRATEGIES + EXTRA_STRATEGIES
+BY_LABEL = {strategy.label: strategy for strategy in ALL_STRATEGIES}
 
 
-def schedule_lag_p99(path: Path) -> float:
-    """Seconds the client was behind its own schedule at p99.
-
-    If the generator cannot keep up, the arrival pattern it produced is not
-    the trace's, and the run describes a load that was never delivered.
-    """
-    lags = sorted(r["sent_s"] - r["scheduled_s"]
-                  for r in map(json.loads, path.open(encoding="utf-8")))
-    if not lags:
-        return float("nan")
-    return lags[min(int(len(lags) * 0.99), len(lags) - 1)]
-
-
-def ttft_p99(path: Path) -> float:
-    """score_results gives p50/p95; the tail argument needs p99 too."""
-    vals = sorted(r["ttft_s"] for r in map(json.loads, path.open(encoding="utf-8"))
-                  if r.get("error") is None and r.get("ttft_s") is not None)
-    if not vals:
-        return float("nan")
-    return vals[min(int(len(vals) * 0.99), len(vals) - 1)]
-
-
-def worker_split(path: Path) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for r in map(json.loads, path.open(encoding="utf-8")):
-        if r.get("error") is not None:
-            continue
-        w = r.get("worker") or "?"
-        counts[w] = counts.get(w, 0) + 1
-    return counts
+@dataclass(frozen=True)
+class RunSpec:
+    sequence: int
+    repeat: int
+    strategy: StrategyConfig
 
 
 @dataclass
-class Run:
-    arm: str
+class RunResult:
+    strategy: str
     repeat: int
-    out_path: Path
-    order: str = ""
-    hit_rate: float = float("nan")
-    ttft_p50: float = float("nan")
-    ttft_p95: float = float("nan")
-    ttft_p99: float = float("nan")
-    load_cv: float = float("nan")
-    contains: float = float("nan")
-    lag_p99: float = float("nan")
-    split: dict = field(default_factory=dict)
+    sequence: int
+    order: str
+    port: int
+    results_path: str
+    router_log_path: str
     n_ok: int = 0
     n_failed: int = 0
+    cache_hit_rate: float = float("nan")
+    cache_metric: str = "unavailable"
+    cached_tokens_total: int = 0
+    prompt_tokens_total: int = 0
+    # replay.py's ttft_s is phase 2 for the two-phase per-worker protocol and
+    # the ordinary TTFT for one-phase strategies.  Keep the label explicit in
+    # the output so it cannot be mistaken for end-to-end latency.
+    phase2_ttft_p50_s: float = float("nan")
+    phase2_ttft_p99_s: float = float("nan")
+    e2e_ttft_p50_s: float = float("nan")
+    e2e_ttft_p99_s: float = float("nan")
+    e2e_total_p50_s: float = float("nan")
+    e2e_total_p99_s: float = float("nan")
+    throughput_req_s: float = float("nan")
+    load_cv: float = float("nan")
+    contains_gold: float = float("nan")
+    quality_n: int = 0
+    error: str = ""
+
+
+METRICS: tuple[str, ...] = (
+    "cache_hit_rate",
+    "phase2_ttft_p50_s",
+    "phase2_ttft_p99_s",
+    "e2e_ttft_p50_s",
+    "e2e_ttft_p99_s",
+    "e2e_total_p50_s",
+    "e2e_total_p99_s",
+    "throughput_req_s",
+    "load_cv",
+    "contains_gold",
+)
 
 
 @dataclass
-class ArmSummary:
-    arm: str
-    runs: list[Run] = field(default_factory=list)
-
-    def agg(self, attr: str) -> tuple[float, float]:
-        vals = [getattr(r, attr) for r in self.runs
-                if getattr(r, attr) == getattr(r, attr)]  # drop NaN
-        if not vals:
-            return float("nan"), float("nan")
-        if len(vals) == 1:
-            return vals[0], 0.0
-        return statistics.fmean(vals), statistics.stdev(vals)
+class StrategySummary:
+    strategy: str
+    completed_runs: int
+    failed_runs: int
+    metrics: dict[str, dict[str, float | int | None]] = field(default_factory=dict)
 
 
-def confirm_restart(args, arm: str, repeat: int, total: int, index: int) -> None:
-    """Block until the human confirms both engines are cold again."""
-    print()
-    print("=" * 68)
-    print(f"  [{index}/{total}]  repeat {repeat + 1}  |  strategy: {arm}")
-    print("=" * 68)
-    for w in args.worker:
-        print(f"  -> restart vLLM at {w}")
-    print("  -> check for zombie VLLM::EngineCore (nvidia-smi), kill -9 if found")
-    if args.no_pause:
-        print("  (--no-pause: restart NOT confirmed, arms may share a warm cache)")
-        return
-    input("  Both engines restarted and ready? [Enter] ")
+def percentile(values: Iterable[float], p: int) -> float:
+    vals = sorted(values)
+    if not vals:
+        return float("nan")
+    if len(vals) == 1:
+        return vals[0]
+    return statistics.quantiles(vals, n=100, method="inclusive")[p - 1]
 
 
-def one_run(args, arm: str, repeat: int) -> Run:
-    out_path = Path(args.outdir) / f"strat_{arm}_r{repeat + 1}.jsonl"
-    router_url = f"http://127.0.0.1:{ROUTER_PORT}"
-    order = ORDER_FOR_STRATEGY.get(arm, args.default_order)
-
-    env = {"ROUTER_STRATEGY": arm, "ROUTER_TOKENIZER": args.tokenizer}
-    if args.tracker_capacity:
-        env["ROUTER_TRACKER_CAPACITY"] = str(args.tracker_capacity)
-
-    proc = start_router(args, env, ROUTER_PORT)
-    try:
-        asyncio.run(wait_healthy(router_url, timeout_s=args.router_timeout))
-        run_replay(args, Path(args.trace), router_url, order, args.speedup, out_path)
-    finally:
-        # Always stopped, even if replay raised: a router left listening would
-        # be inherited by the next arm with its tracker already warm.
-        stop_router(proc)
-
-    cell = score_results(out_path)
-    run = Run(arm=arm, repeat=repeat, out_path=out_path, order=order,
-              hit_rate=cell.cache_hit_rate, ttft_p50=cell.ttft_p50_s,
-              ttft_p95=cell.ttft_p95_s, load_cv=cell.load_cv,
-              n_ok=cell.n_ok, n_failed=cell.n_failed)
-    run.ttft_p99 = ttft_p99(out_path)
-    run.split = worker_split(out_path)
-    try:
-        run.contains = evaluate(out_path)["contains"]
-    except SystemExit:
-        pass  # no gold answers in this trace; cache metrics still stand
-    run.lag_p99 = schedule_lag_p99(out_path)
-
-    split_s = " ".join(f"{k}:{v}" for k, v in sorted(run.split.items()))
-    print(f"  hit={run.hit_rate:.1%}  ttft p50={run.ttft_p50:.3f}s "
-          f"p95={run.ttft_p95:.3f}s p99={run.ttft_p99:.3f}s  "
-          f"quality={run.contains:.1%}  split[{split_s}]  "
-          f"({run.n_ok} ok, {run.n_failed} failed)")
-    if run.lag_p99 > LAG_WARN_S:
-        print(f"  !! schedule lag p99 = {run.lag_p99:.2f}s -- the client fell behind,")
-        print(f"     so this run's arrival pattern is NOT the trace's. Lower --speedup.")
-    return run
+def finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def judge(summaries: list[ArmSummary], attr: str, label: str,
-          lower_is_better: bool = False) -> None:
-    """Does the between-arm gap survive the within-arm spread?
-
-    Compared against 2x the largest stdev rather than a fixed threshold, so
-    the verdict comes from this experiment's own noise, not a borrowed constant.
-    """
-    ranked = sorted((s for s in summaries if s.agg(attr)[0] == s.agg(attr)[0]),
-                    key=lambda s: s.agg(attr)[0], reverse=not lower_is_better)
-    if len(ranked) < 2:
-        return
-    best, worst = ranked[0], ranked[-1]
-    bv, bs = best.agg(attr)
-    wv, ws = worst.agg(attr)
-    gap = abs(bv - wv)
-    noise = 2 * max(bs, ws)
-    fmt = (lambda v: f"{v:.3f}s") if "ttft" in attr else (lambda v: f"{v:.1%}")
-    print()
-    print(f"{label}: best {best.arm} {fmt(bv)}  |  worst {worst.arm} {fmt(wv)}")
-    print(f"  gap {fmt(gap)}   (2x largest stdev = {fmt(noise)})")
-    if gap > noise:
-        print(f"  -> {best.arm} separates from {worst.arm} beyond run-to-run spread.")
-    else:
-        print(f"  -> gap does NOT clear the spread; not distinguishable at this "
-              f"repeat count.")
-
-    # The pairwise question the report actually turns on, when both are present.
-    names = {s.arm: s for s in ranked}
-    if "cache_aware" in names and "cacheweaver_dualmap" in names:
-        a, b = names["cache_aware"], names["cacheweaver_dualmap"]
-        av, as_ = a.agg(attr)
-        bv2, bs2 = b.agg(attr)
-        d = abs(av - bv2)
-        n2 = 2 * max(as_, bs2)
-        verdict = "SEPARATE" if d > n2 else "NOT separable"
-        print(f"  cache_aware {fmt(av)} vs cacheweaver_dualmap {fmt(bv2)} "
-              f"-> {verdict} (diff {fmt(d)}, noise {fmt(n2)})")
+def json_safe(value: Any) -> Any:
+    """Replace non-finite floats recursively; strict JSON has no NaN value."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
 
 
-def report(summaries: list[ArmSummary], repeats: int) -> None:
-    print()
-    print("=" * 92)
-    print(f"  {repeats} run(s) per arm")
-    print("=" * 92)
-    print(f"{'strategy':<22}{'hit rate':>16}{'TTFT p50':>16}"
-          f"{'TTFT p99':>16}{'load CV':>12}{'quality':>14}")
-    for s in summaries:
-        h, hs = s.agg("hit_rate")
-        t, ts = s.agg("ttft_p50")
-        t9, t9s = s.agg("ttft_p99")
-        c, _ = s.agg("load_cv")
-        q, qs = s.agg("contains")
-        print(f"{s.arm:<22}{h:>9.1%} ±{hs:.1%}{t:>10.3f}s ±{ts:.3f}"
-              f"{t9:>10.3f}s ±{t9s:.3f}{c:>11.3f}{q:>8.1%} ±{qs:.1%}")
-
-    if repeats < 2 or len(summaries) < 2:
-        print("\n(2+ arms and 2+ repeats needed to judge separation)")
-        return
-    judge(summaries, "hit_rate", "CACHE HIT RATE")
-    judge(summaries, "ttft_p50", "TTFT p50", lower_is_better=True)
-    judge(summaries, "ttft_p99", "TTFT p99 (tail)", lower_is_better=True)
+def select_strategies(args: argparse.Namespace) -> list[StrategyConfig]:
+    if args.strategies:
+        wanted = [name.strip() for name in args.strategies.split(",") if name.strip()]
+        if not wanted:
+            raise SystemExit("--strategies is empty")
+        if len(set(wanted)) != len(wanted):
+            raise SystemExit("--strategies contains a duplicate label")
+        unknown = [name for name in wanted if name not in BY_LABEL]
+        if unknown:
+            raise SystemExit(
+                f"unknown strategy label(s): {unknown}; valid: {sorted(BY_LABEL)}"
+            )
+        return [BY_LABEL[name] for name in wanted]
+    return list(ALL_STRATEGIES if args.all_strategies else CORE_STRATEGIES)
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--corpus", default="./corpus")
-    p.add_argument("--trace", required=True)
-    p.add_argument("--outdir", default="runs/strat")
-    p.add_argument("--worker", action="append", required=True,
-                   help="worker base URL; repeatable (must match your deployment)")
-    p.add_argument("--arms",
-                   default="round_robin,least_loaded,cache_aware,"
-                           "cacheweaver_dualmap,per_worker_tree",
-                   help="comma-separated ROUTER_STRATEGY values")
-    p.add_argument("--repeats", type=int, default=3)
-    p.add_argument("--default-order", default="canonical",
-                   help="replay.py --order for every arm EXCEPT those in "
-                        "ORDER_FOR_STRATEGY; held constant so the one variable "
-                        "is the routing strategy, not the chunk order")
-    p.add_argument("--tokenizer", default="hf")
-    p.add_argument("--tracker-capacity", type=int, default=0,
-                   help="ROUTER_TRACKER_CAPACITY = GPU KV cache size / BLOCK_SIZE, "
-                        "using the SMALLER of the two workers. Re-measure per "
-                        "restart; do not leave it at the 50000 default")
-    p.add_argument("--top-k", type=int, default=3)
-    p.add_argument("--limit", type=int, default=800)
-    p.add_argument("--speedup", type=float, default=5.0)
-    p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    p.add_argument("--router-timeout", type=float, default=120.0)
-    p.add_argument("--no-pause", action="store_true",
-                   help="skip the restart prompts (dry runs only -- without a "
-                        "cold engine per arm the comparison is invalid)")
-    args = p.parse_args()
+def build_plan(strategies: list[StrategyConfig], repeats: int) -> list[RunSpec]:
+    """Build a repeat-major schedule whose starting arm rotates each repeat."""
+    plan: list[RunSpec] = []
+    sequence = 0
+    for repeat in range(repeats):
+        offset = repeat % len(strategies)
+        rotated = strategies[offset:] + strategies[:offset]
+        for strategy in rotated:
+            sequence += 1
+            plan.append(RunSpec(sequence, repeat, strategy))
+    return plan
 
-    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    if not arms:
-        raise SystemExit("--arms is empty")
 
-    # Absolute, because replay.py is launched with cwd=BENCH_DIR. A relative
-    # path typed at the repo root would resolve against bench/ and fail there,
-    # with the real error buried in a captured pipe.
+def show_plan(args: argparse.Namespace, plan: list[RunSpec]) -> None:
+    print(
+        f"strategy sweep: repeats={args.repeats}, top_k={args.top_k}, "
+        f"limit={args.limit}, speedup={args.speedup:g}, tokenizer={args.tokenizer}, "
+        f"semantic_top_k={args.semantic_top_k}"
+    )
+    print(f"{'run':>4} {'repeat':>6} {'strategy':<28} order")
+    print("-" * 68)
+    for spec in plan:
+        print(
+            f"{spec.sequence:>4} {spec.repeat + 1:>6} "
+            f"{spec.strategy.label:<28} {spec.strategy.order}"
+        )
+    print(f"\n{len(plan)} runs (dry-run: no files written, no processes started)")
+
+
+def validate_live_args(args: argparse.Namespace) -> None:
+    if args.tracker_capacity is None or args.tracker_capacity <= 0:
+        raise SystemExit(
+            "a positive, measured --tracker-capacity is required for live runs "
+            "(--dry-run is the only exception)"
+        )
+    if len(args.worker) != 2:
+        raise SystemExit("exactly two --worker URLs are required for a live run")
+    if not args.trace:
+        raise SystemExit("--trace is required for a live run")
+
     for attr in ("corpus", "trace"):
         path = Path(getattr(args, attr)).expanduser().resolve()
         if not path.exists():
             raise SystemExit(f"--{attr}: not found: {path}")
         setattr(args, attr, str(path))
-    args.outdir = Path(args.outdir).expanduser().resolve()
-    args.outdir.mkdir(parents=True, exist_ok=True)
 
-    if not args.tracker_capacity:
-        print("WARNING: --tracker-capacity not set, router will use the 50000")
-        print("         default. That constant is machine-specific and has")
-        print("         already inverted one finding in this project.")
 
-    pwt = [a for a in arms if a in ORDER_FOR_STRATEGY]
-    if pwt:
-        print(f"NOTE: {', '.join(pwt)} will run with --order "
-              f"{ORDER_FOR_STRATEGY[pwt[0]]} (two-phase /router/decide_order);")
-        print(f"      every other arm uses --order {args.default_order}.")
+def confirm_cold(args: argparse.Namespace, spec: RunSpec, total: int) -> None:
+    print()
+    print("=" * 76)
+    print(
+        f"  [{spec.sequence}/{total}] repeat {spec.repeat + 1} | "
+        f"strategy: {spec.strategy.label}"
+    )
+    print("=" * 76)
+    print("  Cold-start requirement: restart every vLLM worker before this run:")
+    for worker in args.worker:
+        print(f"    -> {worker}")
+    input("  Both workers are restarted, healthy, and cold? [Enter] ")
 
-    summaries = {a: ArmSummary(arm=a) for a in arms}
-    total = len(arms) * args.repeats
-    index = 0
 
-    for rep in range(args.repeats):
-        # Rotate so no arm is permanently first in the sequence.
-        for arm in arms[rep % len(arms):] + arms[:rep % len(arms)]:
-            index += 1
-            confirm_restart(args, arm, rep, total, index)
-            summaries[arm].runs.append(one_run(args, arm, rep))
+def read_e2e_totals(path: Path) -> tuple[float, float]:
+    """Read optional end-to-end totals added by the two-phase replay path."""
+    values: list[float] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            if row.get("error") is not None:
+                continue
+            value = row.get("e2e_total_s")
+            if finite(value):
+                values.append(float(value))
+    return percentile(values, 50), percentile(values, 99)
 
-    ordered = [summaries[a] for a in arms]
-    report(ordered, args.repeats)
 
-    summary_path = Path(args.outdir) / "strategy_sweep.json"
-    # The configuration travels with the numbers, so a later comparison does
-    # not depend on a directory name to remember what was varied.
-    config = {k: getattr(args, k) for k in
-              ("repeats", "speedup", "top_k", "limit", "default_order",
-               "tokenizer", "tracker_capacity", "trace", "corpus", "worker")
-              if hasattr(args, k)}
-    summary_path.write_text(json.dumps(
-        {"config": config,
-         "arms": {s.arm: [r.__dict__ | {"out_path": str(r.out_path)} for r in s.runs]
-                  for s in ordered}}, indent=2), encoding="utf-8")
-    print(f"\nraw: {summary_path}")
+def score_run(
+    spec: RunSpec,
+    port: int,
+    results_path: Path,
+    router_log_path: Path,
+    workers: list[str],
+) -> RunResult:
+    expected_workers = [f"w{i + 1}" for i in range(len(workers))]
+    cell = score_results(results_path, expected_workers)
+    result = RunResult(
+        strategy=spec.strategy.label,
+        repeat=spec.repeat + 1,
+        sequence=spec.sequence,
+        order=spec.strategy.order,
+        port=port,
+        results_path=str(results_path),
+        router_log_path=str(router_log_path),
+        n_ok=cell.n_ok,
+        n_failed=cell.n_failed,
+        cache_hit_rate=cell.cache_hit_rate,
+        cache_metric=getattr(cell, "cache_metric", "unavailable"),
+        cached_tokens_total=getattr(cell, "cached_tokens_total", 0),
+        prompt_tokens_total=getattr(cell, "prompt_tokens_total", 0),
+        phase2_ttft_p50_s=cell.ttft_p50_s,
+        phase2_ttft_p99_s=getattr(cell, "ttft_p99_s", float("nan")),
+        e2e_ttft_p50_s=getattr(cell, "e2e_ttft_p50_s", float("nan")),
+        e2e_ttft_p99_s=getattr(cell, "e2e_ttft_p99_s", float("nan")),
+        throughput_req_s=cell.throughput_req_s,
+        load_cv=cell.load_cv,
+        error=cell.error,
+    )
+    result.e2e_total_p50_s, result.e2e_total_p99_s = read_e2e_totals(results_path)
+    try:
+        quality = evaluate(results_path)
+    except SystemExit as exc:
+        print(f"  quality unavailable: {exc}")
+    else:
+        result.contains_gold = quality["contains"]
+        result.quality_n = quality["n"]
+    return result
+
+
+def run_one(
+    args: argparse.Namespace,
+    spec: RunSpec,
+    port: int,
+    outdir: Path,
+) -> RunResult:
+    stem = f"strategy_{spec.strategy.label}_r{spec.repeat + 1}"
+    results_path = outdir / f"{stem}.jsonl"
+    router_log_path = outdir / f"router_{port}_{spec.strategy.label}_r{spec.repeat + 1}.log"
+    router_url = f"http://127.0.0.1:{port}"
+
+    # Pin the shared policy knobs that define this protocol instead of
+    # inheriting a stale shell override from an earlier beta/timing experiment.
+    env = {
+        "ROUTER_ALPHA": "1.0",
+        "ROUTER_BETA": "1.0",
+        "ROUTER_DELTA0": "0.5",
+        "ROUTER_LOAD_REF": "16",
+        "ROUTER_TRACKER_TIMING": "dispatch",
+        "ROUTER_PROTECT_TOP_K": "0",
+        "ROUTER_TOKENIZER": args.tokenizer,
+        "ROUTER_TOKENIZER_MODEL": args.model,
+        "ROUTER_TRACKER_CAPACITY": str(args.tracker_capacity),
+        **spec.strategy.env,
+    }
+    if spec.strategy.label == "adaptive_cache_aware":
+        env.update({
+            "ROUTER_D_TARGET": "0.322",
+            "ROUTER_DRIFT_LAM": "0.1",
+            "ROUTER_CUSUM_K": "0.03",
+            "ROUTER_CUSUM_H": "0.30",
+        })
+    if spec.strategy.label == "semantic_per_worker_tree":
+        env["ROUTER_SEMANTIC_TOP_K"] = str(args.semantic_top_k)
+
+    proc = start_router(args, env, port, router_log_path)
+    try:
+        asyncio.run(wait_healthy(router_url, timeout_s=args.router_timeout))
+        run_replay(
+            args,
+            Path(args.trace),
+            router_url,
+            spec.strategy.order,
+            args.speedup,
+            results_path,
+        )
+    finally:
+        stop_router(proc)
+
+    result = score_run(spec, port, results_path, router_log_path, args.worker)
+    print(
+        f"  hit={result.cache_hit_rate:.1%}  "
+        f"phase2 TTFT p50/p99={result.phase2_ttft_p50_s:.3f}/"
+        f"{result.phase2_ttft_p99_s:.3f}s  "
+        f"e2e TTFT p50/p99={result.e2e_ttft_p50_s:.3f}/"
+        f"{result.e2e_ttft_p99_s:.3f}s  load CV={result.load_cv:.3f}  "
+        f"contains={result.contains_gold:.1%}"
+    )
+    return result
+
+
+def failed_result(spec: RunSpec, port: int, outdir: Path, exc: Exception) -> RunResult:
+    stem = f"strategy_{spec.strategy.label}_r{spec.repeat + 1}"
+    return RunResult(
+        strategy=spec.strategy.label,
+        repeat=spec.repeat + 1,
+        sequence=spec.sequence,
+        order=spec.strategy.order,
+        port=port,
+        results_path=str(outdir / f"{stem}.jsonl"),
+        router_log_path=str(
+            outdir / f"router_{port}_{spec.strategy.label}_r{spec.repeat + 1}.log"
+        ),
+        error=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def summarise(results: list[RunResult], strategies: list[StrategyConfig]) -> list[StrategySummary]:
+    summaries: list[StrategySummary] = []
+    for strategy in strategies:
+        runs = [run for run in results if run.strategy == strategy.label]
+        completed = [run for run in runs if not run.error]
+        metric_summary: dict[str, dict[str, float | int | None]] = {}
+        for metric in METRICS:
+            values = [
+                float(getattr(run, metric))
+                for run in completed
+                if finite(getattr(run, metric))
+            ]
+            if not values:
+                metric_summary[metric] = {"mean": None, "stdev": None, "n": 0}
+            else:
+                metric_summary[metric] = {
+                    "mean": statistics.fmean(values),
+                    "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
+                    "n": len(values),
+                }
+        summaries.append(
+            StrategySummary(
+                strategy=strategy.label,
+                completed_runs=len(completed),
+                failed_runs=len(runs) - len(completed),
+                metrics=metric_summary,
+            )
+        )
+    return summaries
+
+
+def print_summary(summaries: list[StrategySummary]) -> None:
+    print()
+    print("=" * 118)
+    print("Repeated strategy summary (mean +/- sample stdev)")
+    print("=" * 118)
+    print(
+        f"{'strategy':<28}{'cache hit':>18}{'phase2 TTFT p50':>22}"
+        f"{'phase2 TTFT p99':>22}{'load CV':>14}{'contains':>14}"
+    )
+    for summary in summaries:
+        def pair(metric: str) -> tuple[float, float]:
+            row = summary.metrics[metric]
+            return float(row["mean"] or 0.0), float(row["stdev"] or 0.0)
+
+        hit, hit_sd = pair("cache_hit_rate")
+        p50, p50_sd = pair("phase2_ttft_p50_s")
+        p99, p99_sd = pair("phase2_ttft_p99_s")
+        cv, cv_sd = pair("load_cv")
+        quality, quality_sd = pair("contains_gold")
+        print(
+            f"{summary.strategy:<28}{hit:>10.1%} +/-{hit_sd:.1%}"
+            f"{p50:>13.3f}s +/-{p50_sd:.3f}"
+            f"{p99:>13.3f}s +/-{p99_sd:.3f}"
+            f"{cv:>8.3f} +/-{cv_sd:.3f}"
+            f"{quality:>8.1%} +/-{quality_sd:.1%}"
+        )
+
+
+def separation_verdict(summaries: list[StrategySummary]) -> dict[str, Any] | None:
+    """Predeclared comparison: cache_aware against CacheWeaver DualMap."""
+    by_name = {summary.strategy: summary for summary in summaries}
+    names = ("cache_aware", "cacheweaver_dualmap")
+    if not all(name in by_name for name in names):
+        return None
+
+    verdict: dict[str, Any] = {"arms": list(names), "rule": "gap > 2*max(stdev)"}
+    verdict["metrics"] = {}
+    for metric in ("cache_hit_rate", "phase2_ttft_p50_s", "phase2_ttft_p99_s"):
+        left = by_name[names[0]].metrics[metric]
+        right = by_name[names[1]].metrics[metric]
+        if left["mean"] is None or right["mean"] is None:
+            verdict["metrics"][metric] = {"separated": None}
+            continue
+        gap = abs(float(left["mean"]) - float(right["mean"]))
+        noise = 2.0 * max(float(left["stdev"] or 0.0), float(right["stdev"] or 0.0))
+        verdict["metrics"][metric] = {
+            "absolute_gap": gap,
+            "noise_threshold": noise,
+            "separated": gap > noise,
+        }
+    return verdict
+
+
+def write_outputs(
+    args: argparse.Namespace,
+    strategies: list[StrategyConfig],
+    results: list[RunResult],
+    summaries: list[StrategySummary],
+    outdir: Path,
+) -> None:
+    csv_path = outdir / "strategy_sweep.csv"
+    metric_columns = [
+        column
+        for metric in METRICS
+        for column in (f"{metric}_mean", f"{metric}_stdev", f"{metric}_n")
+    ]
+    csv_fields = ["strategy", "completed_runs", "failed_runs", *metric_columns]
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=csv_fields)
+        writer.writeheader()
+        for summary in summaries:
+            row: dict[str, Any] = {
+                "strategy": summary.strategy,
+                "completed_runs": summary.completed_runs,
+                "failed_runs": summary.failed_runs,
+            }
+            for metric, values in summary.metrics.items():
+                row[f"{metric}_mean"] = values["mean"]
+                row[f"{metric}_stdev"] = values["stdev"]
+                row[f"{metric}_n"] = values["n"]
+            writer.writerow(row)
+
+    config = {
+        "strategies": [strategy.label for strategy in strategies],
+        "repeats": args.repeats,
+        "top_k": args.top_k,
+        "limit": args.limit,
+        "speedup": args.speedup,
+        "tokenizer": args.tokenizer,
+        "semantic_top_k": args.semantic_top_k,
+        "tracker_capacity": args.tracker_capacity,
+        "model": args.model,
+        "corpus": args.corpus,
+        "trace": args.trace,
+        "workers": args.worker,
+    }
+    json_path = outdir / "strategy_sweep.json"
+    payload = {
+        "config": config,
+        "runs": [asdict(result) for result in results],
+        "summaries": [asdict(summary) for summary in summaries],
+        "cache_aware_vs_cacheweaver_dualmap": separation_verdict(summaries),
+    }
+    json_path.write_text(
+        json.dumps(json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    print(f"\nJSON summary: {json_path}")
+    print(f"CSV summary : {csv_path}")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--corpus", default="./corpus")
+    parser.add_argument("--trace", default="runs/trace_hot.jsonl")
+    parser.add_argument("--outdir", default="runs/strategy_sweep")
+    parser.add_argument("--worker", action="append", default=[])
+    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--limit", type=int, default=800)
+    parser.add_argument("--speedup", type=float, default=8.0)
+    parser.add_argument("--tokenizer", default="hf")
+    parser.add_argument(
+        "--semantic-top-k",
+        type=int,
+        default=1,
+        help="workers retained by semantic pre-filter (semantic arm only; pool size is 2)",
+    )
+    parser.add_argument("--tracker-capacity", type=int, default=None)
+    parser.add_argument("--port", type=int, default=8099)
+    parser.add_argument("--router-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--all-strategies",
+        "--all",
+        action="store_true",
+        help="add adaptive_cache_aware and semantic_per_worker_tree",
+    )
+    parser.add_argument(
+        "--strategies",
+        help="explicit comma-separated subset/order; overrides the default/all selection",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the rotated plan; do not validate paths, write files, or start processes",
+    )
+    args = parser.parse_args(argv)
+
+    if args.repeats <= 0:
+        parser.error("--repeats must be positive")
+    if args.top_k <= 0:
+        parser.error("--top-k must be positive")
+    if args.limit < 0:
+        parser.error("--limit cannot be negative")
+    if args.speedup <= 0:
+        parser.error("--speedup must be positive")
+    if not (1 <= args.port <= 65535):
+        parser.error("--port must be between 1 and 65535")
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    strategies = select_strategies(args)
+    if any(s.label == "semantic_per_worker_tree" for s in strategies):
+        if not 1 <= args.semantic_top_k < 2:
+            raise SystemExit(
+                "--semantic-top-k must satisfy 1 <= k < 2 when the semantic "
+                "strategy is selected; k=2 cannot prune a two-worker pool"
+            )
+    plan = build_plan(strategies, args.repeats)
+
+    # This return is intentionally before path checks and mkdir: ``--dry-run``
+    # must be usable on a laptop with no corpus, trace, workers, or GPU.
+    if args.dry_run:
+        show_plan(args, plan)
+        return
+
+    validate_live_args(args)
+    outdir = Path(args.outdir).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    results: list[RunResult] = []
+    for offset, spec in enumerate(plan):
+        port = args.port + offset
+        if port > 65535:
+            raise SystemExit("router port range exceeded 65535; choose a lower --port")
+        confirm_cold(args, spec, len(plan))
+        try:
+            result = run_one(args, spec, port, outdir)
+        except Exception as exc:  # noqa: BLE001 -- preserve the remaining sweep cells
+            result = failed_result(spec, port, outdir, exc)
+            print(f"  FAILED: {result.error}")
+            print(f"  router log: {result.router_log_path}")
+        results.append(result)
+
+    summaries = summarise(results, strategies)
+    print_summary(summaries)
+    write_outputs(args, strategies, results, summaries, outdir)
 
 
 if __name__ == "__main__":

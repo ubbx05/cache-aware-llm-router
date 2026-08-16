@@ -447,12 +447,15 @@ class PerWorkerTreeStrategy(Strategy):
             d_ref=config.D_TARGET, k=config.CUSUM_K, h=config.CUSUM_H
         )
 
-    def decide_order(self, chunk_ids: list[str], snap: Snapshot) -> PerWorkerDecision:
+    def decide_order(self, chunk_ids: list[str], snap: Snapshot,
+                     query_text: str | None = None) -> PerWorkerDecision:
         """Ham (siralanmamis, retrieval sirasindaki) chunk_ids alir, worker +
         o worker'a gore en iyi sira karari doner. Dispatch-time bookkeeping
         burada yapilir (cacheweaver_dualmap ile ayni zamanlama konvansiyonu,
         ablation tablosunun timing farkindan degil algoritma farkindan
-        etkilenmesi icin)."""
+        etkilenmesi icin). query_text ortak iki-asamali endpoint arayuzunun
+        parcasidir; semantik olmayan bu strateji tarafindan kullanilmaz."""
+        del query_text
         healthy_names = [s.name for s in snap.healthy() if s.name in self._names]
         if not healthy_names:
             raise NoHealthyWorker()
@@ -525,18 +528,12 @@ class SemanticPerWorkerTreeStrategy(Strategy):
     semantik favoriler o an unhealthy ise) tum healthy worker'lara geri
     duser -- bir istegi asla ac birakmaz.
 
-    SINIRLAMA -- durustce isaretlenmeli: semantic_worker_router.py'nin
-    kendi docstring'i "retrieval'dan ONCE" diyor, ama bu router'da soru
-    metni chunk'lar retrieve edildikten SONRA, zaten kurulmus prompt'un
-    icinde geliyor (main.py _prompt_text()). decide_order() bu yuzden
-    query_text'i AYRI bir parametre olarak aliyor (chunk_ids'ten degil) --
-    su an main.py'nin /router/decide_order endpoint'i bunu göndermiyor
-    (sadece chunk_ids var, bkz. main.py:354), yani query_text=None
-    gelirse semantik filtre pasif kalir ve davranis duz per_worker_tree'ye
-    esdegerdir. Bu strateji UCTAN UCA henuz vLLM/main.py uzerinden
-    dogrulanmadi -- bkz. smoke_test_semantic.py (izole, main.py'ye
-    dokunmadan dogrulama; ayni PerWorkerTreeStrategy'nin kendi
-    docstring'inde itiraf ettigi sinirlama).
+    Iki-asamali replay yolu ham soru metnini /router/decide_order isteginde
+    query_text olarak tasir; semantik filtre chunk_ids'ten metin cikarmaya
+    calismaz. Tek-asamali genel API yolunda ayri soru alani olmadigi icin
+    select() eldeki duzlestirilmis prompt metnini yedek sinyal olarak kullanir.
+    query_text verilmezse filtre pasif kalir ve davranis duz
+    per_worker_tree'ye esdegerdir.
     """
 
     name = "semantic_per_worker_tree"

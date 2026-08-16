@@ -106,6 +106,9 @@ class Run:
     hit_rate: float = float("nan")
     ttft_p50: float = float("nan")
     ttft_p95: float = float("nan")
+    ttft_p99: float = float("nan")
+    e2e_ttft_p50: float = float("nan")
+    e2e_ttft_p99: float = float("nan")
     load_cv: float = float("nan")
     contains: float = float("nan")
     lag_p99: float = float("nan")
@@ -150,7 +153,8 @@ def one_run(args, arm: str, repeat: int) -> Run:
     if args.tracker_capacity:
         env["ROUTER_TRACKER_CAPACITY"] = str(args.tracker_capacity)
 
-    proc = start_router(args, env, ROUTER_PORT)
+    log_path = Path(args.outdir) / f"router_{ROUTER_PORT}_{arm}_r{repeat + 1}.log"
+    proc = start_router(args, env, ROUTER_PORT, log_path)
     try:
         asyncio.run(wait_healthy(router_url, timeout_s=args.router_timeout))
         run_replay(args, Path(args.trace), router_url, arm, args.speedup, out_path)
@@ -160,10 +164,13 @@ def one_run(args, arm: str, repeat: int) -> Run:
         # already warm, which is the exact confound this script exists to avoid.
         stop_router(proc)
 
-    cell = score_results(out_path)
+    expected_workers = [f"w{i + 1}" for i in range(len(args.worker))]
+    cell = score_results(out_path, expected_workers)
     run = Run(arm=arm, repeat=repeat, out_path=out_path,
               hit_rate=cell.cache_hit_rate, ttft_p50=cell.ttft_p50_s,
-              ttft_p95=cell.ttft_p95_s, load_cv=cell.load_cv,
+              ttft_p95=cell.ttft_p95_s, ttft_p99=cell.ttft_p99_s,
+              e2e_ttft_p50=cell.e2e_ttft_p50_s,
+              e2e_ttft_p99=cell.e2e_ttft_p99_s, load_cv=cell.load_cv,
               n_ok=cell.n_ok, n_failed=cell.n_failed)
     try:
         run.contains = evaluate(out_path)["contains"]

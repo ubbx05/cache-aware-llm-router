@@ -11,7 +11,7 @@ vermeden makul görünen sayılar üretir.
 - **Yanlış veri** (1. bölüm): farklı bir korpus/trace, sorunsuz koşar ama
   buradaki ölçümlerle karşılaştırılamaz.
 - **Yanlış kalibrasyon** (3. bölüm): sabitler bu donanıma ait. Paper'ın kendi
-  bulgusu (Bölüm VI-B), yanlış kalibre edilmiş tek bir sabitin bir ablation'ın
+  bulgusu (Bölüm VI-E), yanlış kalibre edilmiş tek bir sabitin bir ablation'ın
   sonucunu *ters çevirdiği*.
 
 Eksik dosya ya da yanlış IP kendini hemen belli eder; bu ikisi etmez. O yüzden
@@ -39,6 +39,11 @@ a7a395db102006c6132de5f886fe04ea  corpus/qa.jsonl
 a5874ffece10fcf3aa44eea2d4308679  trace.jsonl
 abbe8dec6fa2267e0f919eae0f5f2414  trace_hot.jsonl
 ```
+
+16 Ağustos'ta kullanılan `trace_hot_drift.jsonl` ve
+`trace_low_locality.jsonl` bu eski parmak izi tablosunda yoktur. Uzak'a
+yüklemeden önce bu iki dosyanın MD5 değerlerini ve üretim parametrelerini veri
+manifestine ekle; isim benzerliğini doğrulama yerine kullanma.
 
 Karşı makinede, veri neredeyse:
 
@@ -127,11 +132,12 @@ körlemesine taşınırsa sayılar çıkar ama anlamsız olur.
 
 ### `TRACKER_CAPACITY` neden bu listenin başında
 
-Kodda varsayılanı **50 000** (`config.py:220`) ve şu an çalıştırdığın komutlarda
-`ROUTER_TRACKER_CAPACITY` **hiç geçmiyor** — yani router, her iki makinenin
-gerçek kapasitesinin ~9 katı bir cache'e sahip olduğuna inanarak koşuyor. Paper
-Bölüm VI-B tam olarak bunun sonucunu anlatıyor: kalibrasyondan önce β=0
-kazanıyor görünüyordu, 5840'a düzeltilince 30× yükte kazanan β=1'e döndü.
+Kodda uyumluluk için varsayılan **50 000** (`config.py`), fakat rapora girecek
+runner'lar canlı koşuda pozitif bir `--tracker-capacity` değeri zorunlu tutar.
+16 Ağustos ana strateji, yük/lokalite, ordering-kalibrasyon ve beta koşuları
+5840 ile yapıldı. Yalnız tarihsel timing ve ilk ordering sweep'i 50 000'deydi;
+raporda ayrıca etiketlenir. Paper Bölüm VI-E, eski beta deseninin kapasite
+kalibrasyonundan sonra yeniden üretilmediğini gösteriyor.
 
 `cache_aware` ailesi için bu sabit doğrudan skoru belirliyor. `per_worker_tree`
 ailesi kendi knowledge tree'sini kullandığı için ondan daha az etkileniyor —
@@ -206,7 +212,7 @@ stratejinin suçu sanılır.
 - **Her koldan önce vLLM'i cold restart et.** Prefix cache kalıcı; önceki kolun
   cache'i bir sonrakine kredi yazar.
 - Bir ablation'da **tek bir değişken** oynasın. Sıralama ablation'ında router
-  stratejisi üç kolda da aynı kalmalı.
+  stratejisi dört kolda da aynı kalmalı.
 - `replay.py` sonunda "client fell behind its own schedule" uyarısı verirse o
   koşunun yük ekseni geçersizdir — `--speedup` düşür, koşuyu tekrarla.
 - Tek koşu bir bulgu değil. `score_quality.py` %3'ün altındaki farkları zaten
@@ -214,34 +220,109 @@ stratejinin suçu sanılır.
 
 ---
 
-## 7. Sıralama ablation'ını (faz 2) çalıştırma
+## 7. Ordering ablation'ını çalıştırma
 
-Üç kol, router stratejisi sabit, her koldan önce vLLM restart:
+Dört kolun tek değişkeni chunk sırasıdır; router bütün kollarda
+`cache_aware` kalır. Runner kolları repeat-major döndürür, router'ı her koşuda
+yeniler ve iki vLLM'in soğuk restart edildiğini kullanıcıdan onaylatır.
 
 ```bash
-# --- router (tek sefer başlat, strateji üç kolda da AYNI) ---
-W1_URL=http://localhost:8000 W2_URL=http://<peer>:8000 W2_ENABLED=true \
-  ROUTER_TOKENIZER=hf ROUTER_TRACKER_CAPACITY=<yeni-ölçülen-blok> \
-  ROUTER_STRATEGY=cache_aware python3 main.py &
-
-# --- her kol için: vLLM restart, sonra ---
-cd bench
-python3 replay.py --corpus <veri-dizini>/corpus --trace <veri-dizini>/trace.jsonl \
-  --worker http://localhost:8000 --worker http://<peer>:8000 \
-  --order canonical --out r_canon.jsonl
-#   ... --order relevance --out r_relevance.jsonl
-#   ... --order greedy    --out r_greedy.jsonl
-
-python3 score_quality.py r_canon.jsonl r_relevance.jsonl r_greedy.jsonl
+python3 bench/sweep_ordering.py \
+  --corpus <veri-dizini>/corpus \
+  --trace <veri-dizini>/trace_hot.jsonl \
+  --worker http://localhost:8000 \
+  --worker http://<peer>:8000 \
+  --arms canonical,relevance,greedy,pinned_prefix \
+  --repeats 3 --top-k 10 --limit 300 --speedup 5 \
+  --tokenizer hf --tracker-capacity 5840 \
+  --outdir runs/ordering_calibrated
 ```
 
-`greedy` kolunun üç ek bayrağı var (`--greedy-protect-top-k`, `--greedy-ttl`,
-`--greedy-insert`); varsayılanlar CacheWeaver'ın yayınlanmış semantiğini verir
-ve `--greedy-ttl 30` zaten `per_worker_tree_router` ile aynı. Bunları oynatmak
-ayrı bir ablation'dır, ana üç kolla karıştırma.
+`--no-pause` yalnız dry-run/orkestrasyon testi içindir. Canlı rapor koşusunda
+kullanılırsa soğuk-cache protokolü doğrulanmış sayılmaz. `greedy` bayraklarını
+değiştirmek (`--greedy-protect-top-k`, TTL veya insertion timing) ayrı bir
+ablation'dır.
 
-`--order greedy` çıktısında `reorder depth` (harness'ın kendi ağacının bulduğu
-yeniden kullanılabilir önek) ile `engine cached` (motorun gerçekten cache'ten
-servis ettiği oran) yan yana basılıyor. **İkisi arasındaki uçurum bug değil,
-bulgudur**: tek-global-tree varsayımının blokların hangi replikada olduğu
-konusunda yanılması — `per_worker_tree`'nin var oluş sebebi tam olarak bu.
+## 8. Kalibre ana strateji sweep'i
+
+Önce GPU kullanmadan planı doğrula:
+
+```bash
+python3 bench/sweep_strategy.py --dry-run
+```
+
+Beş çekirdek stratejinin 3 × 5 = 15 canlı koşusu:
+
+```bash
+python3 bench/sweep_strategy.py \
+  --corpus <veri-dizini>/corpus \
+  --trace <veri-dizini>/trace_hot.jsonl \
+  --worker http://localhost:8000 \
+  --worker http://<peer>:8000 \
+  --tracker-capacity 5840 \
+  --outdir runs/strategy_sweep
+```
+
+Varsayılanlar paper protokolüdür: 800 istek, top-k=10, speedup=8, üç tekrar,
+`hf` tokenizer. Çekirdek kollar:
+
+- `round_robin`
+- `least_loaded`
+- `cacheweaver_dualmap`
+- `cache_aware`
+- `per_worker_tree`
+
+`--all-strategies` ayrıca `adaptive_cache_aware` ve
+`semantic_per_worker_tree` kollarını ekler. Yeni semantik sweep varsayılan
+`--semantic-top-k 1` ile gerçek aday eleme yapar; rapordaki eski semantik
+no-op sonucu `top-k=2=N` koşuluna aittir ve bunun yerine kullanılamaz.
+
+Her koşunun raw JSONL'i, özet JSON/CSV'si ve
+`router_<port>_<strategy>_r<repeat>.log` dosyası `--outdir` altına yazılır.
+İki-aşamalı kolda eski completion-fazı alanları korunur; `decision_s`,
+`e2e_ttft_s` ve `e2e_total_s` ayrıca kaydedilir. Yeni karşılaştırmada uçtan
+uca alanı kullan.
+
+## 9. Kalibre beta × yük × lokalite sweep'i
+
+Plan kontrolü:
+
+```bash
+python3 bench/sweep_beta.py --dry-run
+```
+
+Raporlanan 2 × 2 replikasyonu yeniden üretmek için:
+
+```bash
+python3 bench/sweep_beta.py \
+  --corpus <veri-dizini>/corpus \
+  --high-trace <veri-dizini>/trace_hot.jsonl \
+  --low-trace <veri-dizini>/trace_low_locality.jsonl \
+  --worker http://localhost:8000 \
+  --worker http://<peer>:8000 \
+  --loads 30,35 --betas 1,0 --repeats 1 \
+  --tracker-capacity 5840 \
+  --outdir runs/beta_sweep
+```
+
+`--repeats 1` mevcut kalibrasyon replikasyonuyla aynıdır; formal ayrışma
+iddiası için en az üç tekrar kullan. Runner `cache_aware` ve canonical prompt
+sırasını sabit tutar, hücre sırasını tekrarlar arasında döndürür ve sonucu
+nedensel “kazanan” yorumu eklemeden JSON/CSV olarak yazar.
+
+## 10. Runner çıktılarının doğrulanması
+
+- Schedule-lag p99 1 saniyeyi geçerse koşuyu geçersiz say.
+- `n_failed` sıfır değilse ilgili router logunu incele.
+- Cached-token fraction yeni runner'larda toplam cached / toplam prompt token
+  olarak hesaplanır; tarihsel ordering tablosundaki istek-başına ortalamayla
+  aynı değildir.
+- Load CV iki beklenen worker'ı da içerir; tüm trafik tek worker'a giderse
+  iki-worker CV sıfır değil 1'dir.
+- TTFT p99 ana özetin parçasıdır; yalnız p50'ye bakma.
+- Ham JSONL, summary JSON/CSV, router logu, trace manifesti ve çalışan komut
+  birlikte saklanmadan sonuç yeniden üretilebilir sayılmaz.
+
+Uzun ömürlü router süreçleri artık okunmayan `stdout=PIPE` kullanmaz. Uvicorn
+çıktısı dosyaya yazıldığı için yüzlerce access-log satırı pipe buffer'ını
+doldurup sweep'i sessizce kilitlemez.

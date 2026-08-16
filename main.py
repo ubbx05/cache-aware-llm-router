@@ -372,7 +372,9 @@ async def _handle_completion(request: Request, path: str) -> Response:
 @app.post("/router/decide_order")
 async def decide_order(request: Request) -> Response:
     """Two-phase entry point for strategies where the best chunk order
-    depends on which worker is chosen (currently only per_worker_tree).
+    depends on which worker is chosen (per_worker_tree and its semantic
+    variant). The optional query_text field carries the raw question for
+    strategies that use a semantic worker pre-filter.
     replay.py calls this FIRST with the raw, unordered retrieval-order chunk
     ids, gets back {worker, ordered_chunk_ids}, builds the actual prompt in
     that order, then sends the real completion request with
@@ -383,7 +385,7 @@ async def decide_order(request: Request) -> Response:
     if not hasattr(strategy, "decide_order"):
         return JSONResponse(
             {"error": f"strategy '{strategy.name}' does not support decide_order "
-                      f"(only per_worker_tree does)"},
+                      f"(per_worker_tree family only)"},
             status_code=400,
         )
     try:
@@ -392,12 +394,18 @@ async def decide_order(request: Request) -> Response:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
     chunk_ids = body.get("chunk_ids")
-    if not chunk_ids:
+    if (not isinstance(chunk_ids, list) or not chunk_ids
+            or not all(isinstance(chunk_id, str) and chunk_id for chunk_id in chunk_ids)):
         return JSONResponse({"error": "chunk_ids (non-empty list) required"}, status_code=400)
+    query_text = body.get("query_text")
+    if query_text is not None and not isinstance(query_text, str):
+        return JSONResponse({"error": "query_text must be a string"}, status_code=400)
 
     poller: MetricsPoller = state["poller"]
     try:
-        decision = strategy.decide_order(chunk_ids, poller.snapshot())
+        decision = strategy.decide_order(
+            chunk_ids, poller.snapshot(), query_text=query_text
+        )
     except NoHealthyWorker:
         return JSONResponse({"error": "no healthy worker available"}, status_code=503)
 
