@@ -1,0 +1,237 @@
+--- paper_orig.tex	2026-08-16 18:07:22.456108145 +0000
++++ paper.tex	2026-08-16 18:09:41.388533000 +0000
+@@ -248,10 +248,14 @@
+ CacheWeaver~\cite{cacheweaver2026} & $\times$ & \checkmark & $\times$ \\
+ GORGO~\cite{gorgo2026} & \checkmark & $\times$ & \checkmark (evolutionary) \\
+ Semantic caching & $\times$ & $\times$ & $\times$ \\
+-\textbf{This work} & \checkmark & \checkmark & \checkmark (overlap-adaptive) \\
++\textbf{This work} & \checkmark & \checkmark & \checkmark (overlap-adaptive)\textsuperscript{a} \\
+ \bottomrule
+ \end{tabular}%
+ }
++\\[2pt]
++{\footnotesize \textsuperscript{a}Implemented and unit-tested; three repetitions do
++not separate it from fixed weighting (Section~VI-C). The tick denotes a
++mechanism present in the system, not a demonstrated benefit.}
+ \end{table}
+ 
+ This paper combines distributed routing (Section~III-A/B/D) with
+@@ -404,6 +408,11 @@
+ optimistic: the tree is updated before phase two succeeds, so the two
+ HTTP calls are not transactional.
+ 
++Two extensions below are implemented and unit-tested but deliberately
++not on the live decision path for the reported runs; they are described
++here because they constrain how Section~VI-G should be read, not because
++they contributed to any measured number.
++
+ \subsubsection{Token-weighted cache gain} The router module has an
+ optional token-weighted path,
+ $\text{gain}=\text{hit\_tokens}/\text{total\_tokens}$, for cases where
+@@ -481,8 +490,10 @@
+ D_{t-1}$. This EWMA, together with the fixed configured
+ $D_{\text{target}}$, feeds
+ $\beta_{\text{live}} = \beta_{\text{base}} \cdot \text{clip}\!\left(1 +
+-k\cdot\frac{D_{\text{target}} - D_t}{D_{\text{target}}},\,
+-[0.3, 3.0]\right)$, while $\alpha$ is held fixed. A CUSUM detector is
++c\cdot\frac{D_{\text{target}} - D_t}{D_{\text{target}}},\,
++[0.3, 3.0]\right)$, while $\alpha$ is held fixed. The gain $c$ is written
++with a distinct symbol because $k$ already denotes retrieval depth
++throughout this paper and $K$ the CUSUM margin. A CUSUM detector is
+ updated alongside it and recalibrates its own alarm reference, but the
+ returned alarm and recalibrated reference are not consumed by routing.
+ CUSUM is therefore observational telemetry in the current code, not a
+@@ -491,7 +502,18 @@
+ \texttt{adaptive\_cache\_aware}; at retrieval depth ten this gives
+ \texttt{D\_TARGET=0.322} and favours \texttt{CUSUM\_H=0.30} over the
+ previous 0.20 default. The per-worker mode still consumes global
+-adjacency, so the calibrated target is not transferable to that path.
++adjacency, so the calibrated target is not transferable to that path, and
++the size of the mismatch is not marginal: on the same trace the mean
++global-adjacent Jaccard is 0.055 against a within-session reference of
++0.322 (Section~VI-G). Driven by that stream the per-worker threshold mode
++would sit in its low-overlap branch on almost every request, and the EWMA
++mode near the upper end of its clip, so the per-worker adaptive path is
++expected to behave close to a fixed weighting until it is recalibrated
++against global adjacency. Note also that the two figures are not two
++measurements of one quantity: 0.322 is the arrival-ordered, within-session
++stream the detector actually consumes, whereas the 0.476 reported in
++Section~VI-G is the session-grouped summary statistic, and the sequential
++form is the one a detector's state depends on.
+ GPU-free tests verify that \texttt{off} reproduces the fixed baseline
+ and that threshold/EWMA inputs can change a synthetic decision. The
+ live hot and drifted comparisons in Section~VI-C find no outcome
+@@ -587,7 +609,9 @@
+ \caption{Calibrated settings and documented experimental exceptions}
+ \label{tab:calibration}
+ \centering
+-\begin{tabular}{@{}p{0.29\linewidth}p{0.22\linewidth}p{0.37\linewidth}@{}}
++\footnotesize
++\setlength{\tabcolsep}{3pt}
++\begin{tabular}{@{}p{0.30\linewidth}p{0.20\linewidth}p{0.42\linewidth}@{}}
+ \toprule
+ \textbf{Constant} & \textbf{Value} & \textbf{Measured via} \\
+ \midrule
+@@ -596,7 +620,8 @@
+ DualMap-inspired SLO / rebalance thresholds & 38{,}272 / 57{,}408 tokens & \texttt{LOAD\_REF} $\times$ mean prompt tokens; 1.5$\times$ ratio preserved from DualMap's relationship \\
+ \texttt{D\_TARGET} (drift reference) & 0.322 & Arrival-ordered within-session Jaccard stream, top-$k{=}10$, 2{,}170 stable observations \\
+ \texttt{CUSUM\_H} & 0.30 & Grid calibration on nominal and drift-0.1 traces; 26.73 nominal alarms/1{,}000 and 2.20$\times$ separation \\
+-\texttt{TRACKER\_CAPACITY} & 5{,}840 blocks & Smaller worker's KV-cache capacity: $\min(93{,}440,93{,}840)/16$ \\
++\texttt{TRACKER\_\allowbreak CAPACITY} & 5{,}840 blocks & Smaller worker's KV-cache capacity: $\min(93{,}440,\,95{,}424)/16$ \\
++\texttt{ROUTER\_\allowbreak TOKENIZER} & \texttt{hf} & Engine tokenizer; the \texttt{approx} source default does not reproduce block boundaries and shifts every cached-token figure \\
+ \bottomrule
+ \end{tabular}
+ \end{table}
+@@ -611,6 +636,11 @@
+ dispatch/completion sweep and the original ordering run used 50{,}000;
+ both held it fixed across arms and are labelled as historical
+ exceptions. Section~VI-D reports the ordering replication at 5{,}840.
++Each sweep also writes the full policy set ($\alpha$, $\beta$, $\delta_0$,
++\texttt{LOAD\_REF}, bookkeeping mode, \texttt{protect\_top\_k}, tokenizer,
++tracker capacity) into the child router's environment explicitly rather than
++inheriting it, so a stale shell override from an earlier experiment cannot
++silently redefine an arm; the same values are recorded in the run manifest.
+ 
+ \subsection{Overlap Characterisation Tool}
+ 
+@@ -649,16 +679,17 @@
+ \midrule
+ Core strategies & 800 requests, top-$k{=}10$, speedup 8, five arms,
+ three repetitions, capacity 5{,}840 \\
+-Load/locality & \texttt{cache\_aware} vs. \texttt{per\_worker\_tree};
+-speedups 4/8/12 and high/low synthetic locality \\
+-Adaptive/semantic & Three repetitions on hot and drift-0.1 traces;
+-semantic arm retains all two candidates \\
+-Ordering & Four fixed-router orders, top-$k{=}10$, three repetitions;
+-original 50{,}000 and calibrated 5{,}840 capacities \\
+-Beta & High/low locality $\times$ speedups 30/35 $\times\beta\in\{0,1\}$;
+-one retained result per cell at capacity 5{,}840 \\
+-Bookkeeping & Dispatch vs. completion, speedups 5/15, three repetitions;
+-historical capacity 50{,}000 \\
++Load/locality & 800 requests; \texttt{cache\_aware} vs.
++\texttt{per\_worker\_tree}; speedups 4/8/12 and high/low synthetic
++locality \\
++Adaptive/semantic & 800 requests; three repetitions on hot and drift-0.1
++traces; semantic arm retains all two candidates \\
++Ordering & 300 requests; four fixed-router orders, top-$k{=}10$, three
++repetitions; original 50{,}000 and calibrated 5{,}840 capacities \\
++Beta & 800 requests; high/low locality $\times$ speedups 30/35
++$\times\beta\in\{0,1\}$; one retained result per cell at capacity 5{,}840 \\
++Bookkeeping & 300 requests; dispatch vs. completion, speedups 5/15, three
++repetitions; historical capacity 50{,}000 \\
+ \bottomrule
+ \end{tabular}
+ \end{table}
+@@ -685,10 +716,18 @@
+ completion request. Their decision call, prompt construction, and first
+ HTTP round trip are excluded. They also use a separator five tokens
+ longer at each of nine boundaries, adding about 36{,}000 prompt tokens
+-over 800 requests (35{,}997 observed, 1.9\%). The revised replay code
+-uses matched serialization and records decision, completion, and
+-end-to-end fields, but the historical numerical results were not rerun
+-after that fix.
++over 800 requests (35{,}997 observed, 1.9\%). The bias this introduces is
++signed and boundable rather than open-ended. The extra tokens are the same
++sentinel repeated at every boundary of every request, so they are cached at
++a rate at least as high as the prompt average and therefore inflate the
++reported fraction. The worst case is that all 45 count as cached, which
++moves $76.1\%$ to at most $(0.761\cdot 2392+45)/(2392+45)=76.5\%$ --
++equivalently, the corrected value is no lower than about $75.7\%$ and the
++gap over \texttt{cache\_aware} no smaller than about 9.3 points. The
++separation therefore survives the mismatch, but the exact figure must be
++remeasured. The revised replay code uses matched serialization and records
++decision, completion, and end-to-end fields, but the historical numerical
++results were not rerun after that fix.
+ 
+ \section{Results}
+ 
+@@ -726,11 +765,10 @@
+ HTTP round trip are excluded.\par}
+ \end{table*}
+ 
+-Table~\ref{tab:core} supplies the paper's previously missing system-level
+-comparison. Flat cache-aware routing adds 10.9 points over
++Table~\ref{tab:core} gives the system-level comparison. Flat cache-aware routing adds 10.9 points over
+ \texttt{least\_loaded}; worker-specific joint routing and ordering adds
+ another 9.7 points over \texttt{cache\_aware}. Both clear the descriptive
+-spread threshold (1.6 and 0.9 points, respectively). The five quality
++spread threshold (1.6 and 0.8 points, respectively). The five quality
+ means occupy a narrow 77.5--77.8\% band. Conversely,
+ \texttt{cache\_aware} and \texttt{cacheweaver\_dualmap} do not separate
+ on cache reuse, p50, or p99; the earlier single-run latency difference
+@@ -748,7 +786,8 @@
+ fraction over \texttt{cache\_aware} by 9.7 and 12.0 percentage points;
+ the 4$\times$ point has $n{=}1$ and is exploratory. Reported
+ \texttt{per\_worker\_tree} TTFT is completion-path timing, not end to
+-end. Its historical prompt separator also adds 35{,}997 prompt tokens
++end -- this is what the asterisk on the 10.7$\times$ annotation in panel
++(b) marks. Its historical prompt separator also adds 35{,}997 prompt tokens
+ (1.9\%) over 800 requests, so cache denominators are not perfectly
+ matched.}
+ \label{fig:load-locality}
+@@ -793,10 +832,16 @@
+ 0.65--1.28), yet neither the hot nor drifted trace separates from fixed
+ \texttt{cache\_aware}. CUSUM cannot explain this null result because its
+ alarms are telemetry and are not consumed by the router. The reported
+-semantic arm is a structural no-op: top-$k{=}2$ retains both workers, so
+-its identical hit rate says nothing about semantic usefulness. The
+-revised query-carrying protocol and top-$k{=}1$ option require a fresh
+-measurement.
++semantic arm is a no-op for two independent reasons, and the weaker one is
++the one usually quoted. First, top-$k{=}2$ retains both workers, so no
++candidate can be removed. Second, and more basic, that run predates the
++query-carrying two-phase contract: the decision endpoint accepted chunk ids
++only, so the pre-filter was never invoked at all and the arm reduces
++exactly to its non-semantic parent. Its identical hit rate is therefore the
++expected outcome and says nothing about semantic usefulness. Both defects
++are now closed in the harness -- the endpoint carries query text and the
++runner rejects $k{=}N$ for this arm -- so an active ablation is possible,
++but it requires a fresh measurement.
+ 
+ \subsection{Ordering Result Survives Capacity Calibration}
+ 
+@@ -827,6 +872,21 @@
+ historical request-macro metric and must not be numerically conflated
+ with Table~\ref{tab:core}'s run-level aggregate.
+ 
++The harness also records why each arm lands where it does. Greedy finds a
++reusable prefix of 7.17 chunks out of ten on average, strictly positive on
++84.0\% of requests, and changes the retrieval order on 43.3\% of them: the
++win comes from a lever that is engaged often and deeply, not from a rare
++large gain. \texttt{pinned\_prefix} fails for a diagnosable reason rather
++than a mechanical one. Its pinning logic behaves exactly as designed --
++at top-$k{=}3$ it engages on 57.0\% of requests, matching the
++$0.75\times0.762=57.2\%$ predicted by session length four and the measured
++fraction of adjacent same-session pairs sharing at least one chunk -- yet
++at top-$k{=}10$ it never pins the whole list (0.0\% of requests) and pins
++3.38 chunks on average while still perturbing 65.7\% of orders. The result
++is a session-specific prefix in front of roughly seven fresh chunks, which
++suppresses precisely the cross-session sharing a prefix cache lives on.
++The design worked and the idea did not.
++
+ \subsection{Calibrated Beta Matrix}
+ 
+ \begin{table}[t]
+@@ -869,8 +929,20 @@
+ 0.941 to 0.806, rank agreement from 92.5\% to 79.7\%, and
+ underestimation rises from 6.2\% to 29.6\%. Dispatch remains at
+ 0.972--0.980 correlation, 97.1--98.0\% rank agreement, and zero observed
+-underestimation. This historical 50{,}000-block sweep supports the
+-relative load mechanism, not calibrated absolute error.
++underestimation.
++
++The signed error separates the two conventions more sharply than the
++correlation does, and in the direction the mechanism predicts. Dispatch-time
++recording is optimistic by construction -- a block is counted before prefill
++has run -- so it should overestimate, and it does at both loads
++($+31.3{\pm}9.2$ and $+23.7{\pm}1.0$ tokens), never once underestimating
++across six runs. Completion-time recording cannot see sibling requests still
++in flight, so it should underestimate more as concurrency rises, and it does:
++from $-5.2{\pm}20.3$ tokens at $5\times$ to $-170.3{\pm}25.5$ at $15\times$.
++That only one convention degrades, in its predicted direction, is what
++distinguishes this from load degrading both. This historical
++50{,}000-block sweep supports the relative load mechanism, not calibrated
++absolute error.
+ 
+ Trace calibration changes \texttt{D\_TARGET} from 0.529 to 0.322 and
+ \texttt{CUSUM\_H} from 0.20 to 0.30. The latter reduces nominal alarms
