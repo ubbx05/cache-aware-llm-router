@@ -856,29 +856,21 @@ observed differences lie in queueing behaviour.
 
 \subsection{Bookkeeping and Drift Diagnostics}
 
-\begin{table}[t]
-\caption{Cache-state accuracy at two replay loads (three runs per mode)}
-\label{tab:timing}
+\begin{figure}[t]
 \centering
-\footnotesize
-\setlength{\tabcolsep}{2pt}
-\begin{tabular}{@{}llccc@{}}
-\toprule
-\textbf{Spd.} & \textbf{Mode} & \textbf{Corr.} & \textbf{Rank agree.} & \textbf{Underest.} \\
-\midrule
-$5\times$ & Dispatch & $0.972{\pm}0.010$ & $97.1{\pm}0.6\%$ & $0.0{\pm}0.0\%$ \\
-$5\times$ & Completion & $0.941{\pm}0.011$ & $92.5{\pm}0.6\%$ & $6.2{\pm}0.7\%$ \\
-$15\times$ & Dispatch & $0.980{\pm}0.003$ & $98.0{\pm}0.0\%$ & $0.0{\pm}0.0\%$ \\
-$15\times$ & Completion & $0.806{\pm}0.008$ & $79.7{\pm}0.9\%$ & $29.6{\pm}0.8\%$ \\
-\bottomrule
-\end{tabular}
-\end{table}
+\includegraphics[width=0.80\columnwidth]{figures/dispatch_completion.png}
+\caption{Dispatch- versus completion-time bookkeeping (three repetitions
+per mode). Completion accuracy deteriorates with load; dispatch remains
+stable. Error bars show between-run standard deviation.}
+\label{fig:timing}
+\end{figure}
 
-Completion-time bookkeeping misses related requests that are still in
-flight; as load rises, its correlation falls from 0.941 to 0.806 and
-underestimation rises from 6.2\% to 29.6\%, while dispatch remains near
-0.98 correlation. Since this historical sweep uses 50{,}000 blocks, it
-supports the relative load mechanism, not calibrated absolute error.
+From $5\times$ to $15\times$ load, completion correlation falls from
+0.941 to 0.806, rank agreement from 92.5\% to 79.7\%, and
+underestimation rises from 6.2\% to 29.6\%. Dispatch remains at
+0.972--0.980 correlation, 97.1--98.0\% rank agreement, and zero observed
+underestimation. This historical 50{,}000-block sweep supports the
+relative load mechanism, not calibrated absolute error.
 
 Trace calibration changes \texttt{D\_TARGET} from 0.529 to 0.322 and
 \texttt{CUSUM\_H} from 0.20 to 0.30. The latter reduces nominal alarms
@@ -1016,9 +1008,14 @@ comparisons with matched serialization and the new end-to-end timer;
 \textbf{(2)} record reorder depth, changed-order rate, per-worker tree
 occupancy, and decision overhead to isolate why the joint policy wins;
 \textbf{(3)} repeat the locality result on an external workload and attach
-raw runs plus a complete environment fingerprint; and \textbf{(4)} test
+raw runs plus a complete environment fingerprint; \textbf{(4)} test
 semantic pruning, the DualMap-inspired design, and quality protection on
-$N>2$ workers with paired quality analysis.
+$N>2$ workers with paired quality analysis; and \textbf{(5)} explore
+reusing the retrieval embedding already computed per chunk to route
+between heterogeneous model variants (e.g.\ a lightweight classifier
+deciding when a smaller model suffices), which first requires deploying
+a second model and collecting quality-labelled training data, neither
+of which exists yet.
 
 \begin{thebibliography}{00}
 
